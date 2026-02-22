@@ -1,34 +1,77 @@
 """
-MEMBRANE SCIENCE IMAGE ANALYZER  v3.0
+MEMBRANE SCIENCE IMAGE ANALYZER  v2.0
 SEM/TEM Porosity, Fouling & Active Site Analysis
-Malzeme Bilimi & Membran Teknolojileri
 
 Requirements:
     pip install opencv-python pillow scikit-image numpy scipy matplotlib reportlab
 
 Usage:
-    python membrane_analyzer.py
+    python membrane_analyzer_v2.py
+
+Changelog v2.0:
+    NEW  Modular architecture — PorosityAnalyzer, FoulingAnalyzer, ActiveSiteAnalyzer
+    NEW  TypedDict result types for type safety
+    NEW  Python logging module integration
+    NEW  Scale bar support — results in µm when px/µm calibration is set
+    NEW  SNR metric in fouling analysis
+    NEW  Pore size distribution percentiles (D10, D50, D90) in porosity
+    NEW  Drag-and-drop image loading (Windows/Linux/macOS)
+    NEW  Canvas zoom & pan (mouse wheel + drag)
+    NEW  Keyboard shortcuts: Ctrl+O, F5, Ctrl+S, Ctrl+Shift+S, Ctrl+R, Ctrl+Z
+    NEW  Recent files menu (last 8 files, persisted via JSON)
+    NEW  Parameter change "re-run reminder" badge
+    NEW  JSON export (metadata + all numeric results)
+    NEW  PDF export now embeds matplotlib figure as image
+    NEW  Input validation with user-visible error messages
+    NEW  Image metadata panel (size, channels, bit-depth, file size)
+    FIX  All v1.1 fixes carried forward
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import threading
+from __future__ import annotations
+
+import csv
 import datetime
+import io
+import json
+import logging
+import os
+import sys
+import tempfile
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
-import matplotlib
-matplotlib.use("Agg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy import ndimage
 from skimage import measure, exposure
 from skimage.feature import canny
 
+import matplotlib
+matplotlib.use("Agg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("MembraneAnalyzer")
+
+# ─── CONSTANTS ────────────────────────────────────────────────────────────────
+APP_VERSION   = "2.0"
+RECENT_FILE   = Path.home() / ".membrane_analyzer_recent.json"
+MAX_RECENT    = 8
+
 # ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
-C = {
+C: Dict[str, str] = {
     "bg_root":   "#1A1D23",
     "bg_panel":  "#20242C",
     "bg_card":   "#272B35",
@@ -42,6 +85,8 @@ C = {
     "blue_dim":  "#2A4A6B",
     "red":       "#C75F5F",
     "red_dim":   "#5C2B2B",
+    "green":     "#6AC47F",
+    "green_dim": "#2B5235",
     "text_hi":   "#E8EAF0",
     "text_md":   "#B0B8C8",
     "text_lo":   "#6B7589",
@@ -51,11 +96,12 @@ C = {
     "sep":       "#2A2E38",
 }
 
-import sys
-F_UI  = "Segoe UI"   if sys.platform == "win32" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
-F_NUM = "Consolas"   if sys.platform == "win32" else ("Menlo"          if sys.platform == "darwin" else "DejaVu Sans Mono")
+F_UI  = ("Segoe UI"      if sys.platform == "win32"  else
+         "Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
+F_NUM = ("Consolas"      if sys.platform == "win32"  else
+         "Menlo"          if sys.platform == "darwin" else "DejaVu Sans Mono")
 
-FT = {
+FT: Dict[str, tuple] = {
     "title":  (F_UI,  13, "bold"),
     "sec":    (F_UI,   8, "bold"),
     "body":   (F_UI,  10),
@@ -64,158 +110,598 @@ FT = {
     "mono_s": (F_NUM,  8),
 }
 
+# ─── TYPE DEFINITIONS ─────────────────────────────────────────────────────────
+
+class PorosityResult(TypedDict):
+    method: str
+    threshold: Any
+    porosity_pct: float
+    pore_count: int
+    mean_diam_px: float
+    std_diam_px: float
+    min_diam_px: float
+    max_diam_px: float
+    d10_px: float
+    d50_px: float
+    d90_px: float
+    mean_eccentric: float
+    scale_um_per_px: float
+    mean_diam_um: float
+    mask: np.ndarray
+    props: list
+    areas: np.ndarray
+    diameters: np.ndarray
+
+
+class FoulingResult(TypedDict):
+    layer_side: str
+    interface_row_px: int
+    fouling_thickness_px: int
+    fouling_thickness_pct: float
+    layer_mean_intensity: float
+    membrane_mean_intensity: float
+    contrast_ratio: float
+    snr_db: float
+    profile: np.ndarray
+    smooth_grad: np.ndarray
+    edge_map: np.ndarray
+    canny_edges: np.ndarray
+
+
+class ActiveSiteResult(TypedDict):
+    cluster_count: int
+    bright_site_count: int
+    dark_site_count: int
+    total_site_count: int
+    bright_coverage_pct: float
+    dark_coverage_pct: float
+    total_coverage_pct: float
+    bright_props: list
+    dark_props: list
+    bright_mask: np.ndarray
+    dark_mask: np.ndarray
+    centers: np.ndarray
+    g_norm: np.ndarray
+    kmeans_labels: np.ndarray
+
+
+class ComparisonResult(TypedDict):
+    img1_porosity: float
+    img2_porosity: float
+    delta_porosity: float
+    img1_pore_count: int
+    img2_pore_count: int
+    img1_mean_diam: float
+    img2_mean_diam: float
+    r1: PorosityResult
+    r2: PorosityResult
+
+
+@dataclass
+class ImageMeta:
+    path: str       = ""
+    width: int      = 0
+    height: int     = 0
+    channels: int   = 1
+    bit_depth: int  = 8
+    file_size_kb: float = 0.0
+
+    def label(self) -> str:
+        sz = f"{self.file_size_kb:.1f} KB" if self.file_size_kb < 1024 else f"{self.file_size_kb/1024:.2f} MB"
+        return (f"  {Path(self.path).name}  ·  "
+                f"{self.width}×{self.height}  ·  "
+                f"{self.channels}ch  ·  {self.bit_depth}bit  ·  {sz}")
+
+
+# ─── ANALYSIS MODULES ─────────────────────────────────────────────────────────
+
+class BaseAnalyzer:
+    """Shared image loading & validation."""
+
+    def __init__(self):
+        self.original: Optional[np.ndarray] = None
+        self.gray:     Optional[np.ndarray] = None
+        self.meta:     ImageMeta            = ImageMeta()
+
+    def load_image(self, path: str) -> np.ndarray:
+        if not Path(path).exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            try:
+                pil = Image.open(path).convert("RGB")
+                img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                raise ValueError(f"Cannot load image: {path}\n{e}")
+        # Normalise to 8-bit BGR
+        if img.dtype == np.uint16:
+            img = (img / 256).astype(np.uint8)
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        h, w = img.shape[:2]
+        if h < 32 or w < 32:
+            raise ValueError(f"Image too small ({w}×{h} px). Minimum: 32×32.")
+
+        self.original = img
+        self.gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        file_kb = Path(path).stat().st_size / 1024
+        self.meta = ImageMeta(
+            path=path, width=w, height=h,
+            channels=img.shape[2], bit_depth=8,
+            file_size_kb=file_kb,
+        )
+        log.info("Loaded image: %s  (%dx%d)", Path(path).name, w, h)
+        return img
+
+
+class PorosityAnalyzer(BaseAnalyzer):
+    """Pore detection & morphometric analysis."""
+
+    def analyze(
+        self,
+        method: str = "otsu",
+        min_pore_px: int = 10,
+        scale_um_per_px: float = 1.0,
+    ) -> PorosityResult:
+        if self.gray is None:
+            raise RuntimeError("No image loaded.")
+        if min_pore_px < 1:
+            raise ValueError("Min pore size must be ≥ 1 px.")
+
+        g = self.gray.copy()
+        if method == "otsu":
+            thresh, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        elif method == "adaptive":
+            mask  = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                          cv2.THRESH_BINARY_INV, 31, 5)
+            thresh = None
+        elif method == "triangle":
+            thresh, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_TRIANGLE)
+        else:
+            raise ValueError(f"Unknown threshold method: '{method}'")
+
+        kernel     = np.ones((3, 3), np.uint8)
+        mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        labeled    = measure.label(mask_clean)
+        props      = [p for p in measure.regionprops(labeled) if p.area >= min_pore_px]
+
+        valid_mask = np.zeros_like(mask_clean)
+        for p in props:
+            valid_mask[labeled == p.label] = 255
+
+        areas     = np.array([p.area   for p in props]) if props else np.array([])
+        diameters = (2 * np.sqrt(areas / np.pi)) if len(areas) else np.array([])
+        eccs      = np.array([p.eccentricity for p in props]) if props else np.array([])
+
+        def _pct(arr, q):
+            return round(float(np.percentile(arr, q)) if len(arr) else 0, 2)
+
+        mean_d_px = round(float(np.mean(diameters)) if len(diameters) else 0, 2)
+
+        result: PorosityResult = {
+            "method":         method,
+            "threshold":      thresh if thresh is not None else "adaptive",
+            "porosity_pct":   round(int(np.sum(valid_mask > 0)) / g.size * 100, 3),
+            "pore_count":     len(props),
+            "mean_diam_px":   mean_d_px,
+            "std_diam_px":    round(float(np.std(diameters))  if len(diameters) else 0, 2),
+            "min_diam_px":    round(float(np.min(diameters))  if len(diameters) else 0, 2),
+            "max_diam_px":    round(float(np.max(diameters))  if len(diameters) else 0, 2),
+            "d10_px":         _pct(diameters, 10),
+            "d50_px":         _pct(diameters, 50),
+            "d90_px":         _pct(diameters, 90),
+            "mean_eccentric": round(float(np.mean(eccs)) if len(eccs) else 0, 3),
+            "scale_um_per_px": scale_um_per_px,
+            "mean_diam_um":   round(mean_d_px * scale_um_per_px, 3),
+            "mask":           valid_mask,
+            "props":          props,
+            "areas":          areas,
+            "diameters":      diameters,
+        }
+        log.info("Porosity: %.3f %% | %d pores", result["porosity_pct"], result["pore_count"])
+        return result
+
+
+class FoulingAnalyzer(BaseAnalyzer):
+    """Fouling layer thickness & intensity analysis."""
+
+    def analyze(self, layer_side: str = "top") -> FoulingResult:
+        if self.gray is None:
+            raise RuntimeError("No image loaded.")
+
+        valid_sides = ("top", "bottom", "left", "right")
+        if layer_side not in valid_sides:
+            raise ValueError(f"layer_side must be one of {valid_sides}, got '{layer_side}'")
+
+        g    = self.gray.copy()
+        h, w = g.shape
+
+        if layer_side in ("top", "bottom"):
+            profile, dim = np.mean(g, axis=1), h
+        else:
+            profile, dim = np.mean(g, axis=0), w
+
+        sobelx      = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=5)
+        sobely      = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=5)
+        edge_map    = np.sqrt(sobelx**2 + sobely**2)
+        canny_edges = canny(g.astype(float) / 255.0, sigma=2.0)
+
+        smooth_grad = ndimage.gaussian_filter1d(np.abs(np.gradient(profile)), sigma=5)
+        half        = dim // 2
+
+        if layer_side in ("top", "left"):
+            idx   = int(np.argmax(smooth_grad[:half]))
+            thick = idx
+        else:  # bottom, right
+            idx   = dim - int(np.argmax(smooth_grad[half:][::-1])) - 1
+            thick = dim - idx
+
+        if layer_side == "top":
+            lr, mr = g[:idx, :], g[idx:, :]
+        elif layer_side == "bottom":
+            lr, mr = g[idx:, :], g[:idx, :]
+        elif layer_side == "left":
+            lr, mr = g[:, :idx], g[:, idx:]
+        else:
+            lr, mr = g[:, idx:], g[:, :idx]
+
+        l_mean = float(np.mean(lr)) if lr.size else 0.0
+        m_mean = float(np.mean(mr)) if mr.size else 0.0
+        noise  = float(np.std(lr))  if lr.size else 1e-9
+        # SNR = signal difference / noise (dB)
+        snr_db = round(20 * np.log10(abs(m_mean - l_mean) / max(noise, 1e-9) + 1e-9), 2)
+
+        result: FoulingResult = {
+            "layer_side":              layer_side,
+            "interface_row_px":        idx,
+            "fouling_thickness_px":    thick,
+            "fouling_thickness_pct":   round(thick / dim * 100, 2),
+            "layer_mean_intensity":    round(l_mean, 2),
+            "membrane_mean_intensity": round(m_mean, 2),
+            "contrast_ratio":          round(float(np.std(g)), 3),
+            "snr_db":                  snr_db,
+            "profile":                 profile,
+            "smooth_grad":             smooth_grad,
+            "edge_map":                edge_map,
+            "canny_edges":             canny_edges,
+        }
+        log.info("Fouling: side=%s | thick=%d px (%.1f%%) | SNR=%.1f dB",
+                 layer_side, thick, result["fouling_thickness_pct"], snr_db)
+        return result
+
+
+class ActiveSiteAnalyzer(BaseAnalyzer):
+    """Active site / catalyst region detection using K-Means + percentile thresholding."""
+
+    def analyze(self, cluster_count: int = 5, min_area: int = 5) -> ActiveSiteResult:
+        if self.gray is None:
+            raise RuntimeError("No image loaded.")
+        if not (2 <= cluster_count <= 12):
+            raise ValueError("cluster_count must be between 2 and 12.")
+
+        g  = self.gray.copy()
+        g8 = (exposure.equalize_adapthist(g, clip_limit=0.03) * 255).astype(np.uint8)
+
+        bm = (g8 >= int(np.percentile(g8, 90))).astype(np.uint8) * 255
+        dm = (g8 <= int(np.percentile(g8, 10))).astype(np.uint8) * 255
+
+        def _extract(mask):
+            c = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+            l = measure.label(c)
+            return [p for p in measure.regionprops(l) if p.area >= min_area], c
+
+        bp, bc = _extract(bm)
+        dp, dc = _extract(dm)
+
+        k = min(cluster_count, 8)
+        pixels = g8.reshape(-1, 1).astype(np.float32)
+        _, lk, centers = cv2.kmeans(
+            pixels, k, None,
+            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 0.1),
+            10, cv2.KMEANS_RANDOM_CENTERS,
+        )
+        lk_img = lk.reshape(g8.shape)
+
+        bright_cov = round(float(np.sum(bc > 0)) / g.size * 100, 3)
+        dark_cov   = round(float(np.sum(dc > 0)) / g.size * 100, 3)
+        total_cov  = round(bright_cov + dark_cov, 3)
+
+        result: ActiveSiteResult = {
+            "cluster_count":       k,
+            "bright_site_count":   len(bp),
+            "dark_site_count":     len(dp),
+            "total_site_count":    len(bp) + len(dp),
+            "bright_coverage_pct": bright_cov,
+            "dark_coverage_pct":   dark_cov,
+            "total_coverage_pct":  total_cov,
+            "bright_props":        bp,
+            "dark_props":          dp,
+            "bright_mask":         bc,
+            "dark_mask":           dc,
+            "centers":             centers,
+            "g_norm":              g8,
+            "kmeans_labels":       lk_img,
+        }
+        log.info("Active sites: bright=%d | dark=%d | total_cov=%.3f%%",
+                 len(bp), len(dp), total_cov)
+        return result
+
+
+class AnalysisEngine:
+    """Facade that holds analysers, current image and all results."""
+
+    def __init__(self):
+        self.por_analyzer   = PorosityAnalyzer()
+        self.foul_analyzer  = FoulingAnalyzer()
+        self.site_analyzer  = ActiveSiteAnalyzer()
+        self.results:   Dict[str, Any] = {}
+        self.img_path:  str            = ""
+        self.scale_um_per_px: float    = 1.0   # 1.0 = px units (not calibrated)
+
+    @property
+    def original(self) -> Optional[np.ndarray]:
+        return self.por_analyzer.original
+
+    @property
+    def gray(self) -> Optional[np.ndarray]:
+        return self.por_analyzer.gray
+
+    @property
+    def meta(self) -> ImageMeta:
+        return self.por_analyzer.meta
+
+    def load_image(self, path: str) -> np.ndarray:
+        self.img_path = path
+        img = self.por_analyzer.load_image(path)
+        self.foul_analyzer.load_image(path)
+        self.site_analyzer.load_image(path)
+        return img
+
+    def analyze_porosity(self, method="otsu", min_pore_px=10) -> PorosityResult:
+        r = self.por_analyzer.analyze(method, min_pore_px, self.scale_um_per_px)
+        self.results["porosity"] = r
+        return r
+
+    def analyze_fouling(self, layer_side="top") -> FoulingResult:
+        r = self.foul_analyzer.analyze(layer_side)
+        self.results["fouling"] = r
+        return r
+
+    def analyze_active_sites(self, cluster_count=5) -> ActiveSiteResult:
+        r = self.site_analyzer.analyze(cluster_count)
+        self.results["active_sites"] = r
+        return r
+
+    def compare_images(self, p1: str, p2: str, method="otsu") -> ComparisonResult:
+        a1, a2 = PorosityAnalyzer(), PorosityAnalyzer()
+        a1.load_image(p1); a2.load_image(p2)
+        r1 = a1.analyze(method, scale_um_per_px=self.scale_um_per_px)
+        r2 = a2.analyze(method, scale_um_per_px=self.scale_um_per_px)
+        result: ComparisonResult = {
+            "img1_porosity":   r1["porosity_pct"],
+            "img2_porosity":   r2["porosity_pct"],
+            "delta_porosity":  round(r2["porosity_pct"] - r1["porosity_pct"], 3),
+            "img1_pore_count": r1["pore_count"],
+            "img2_pore_count": r2["pore_count"],
+            "img1_mean_diam":  r1["mean_diam_px"],
+            "img2_mean_diam":  r2["mean_diam_px"],
+            "r1": r1, "r2": r2,
+        }
+        self.results["comparison"] = result
+        return result
+
+    def export_json(self, path: str):
+        """Export all scalar results + metadata to JSON."""
+        payload: Dict[str, Any] = {
+            "app_version": APP_VERSION,
+            "exported_at": datetime.datetime.now().isoformat(),
+            "image":  {
+                "path":      self.img_path,
+                "width":     self.meta.width,
+                "height":    self.meta.height,
+                "file_kb":   round(self.meta.file_size_kb, 1),
+                "scale_um_per_px": self.scale_um_per_px,
+            },
+            "modules": {}
+        }
+        for mod, data in self.results.items():
+            payload["modules"][mod] = {
+                k: v for k, v in data.items()
+                if isinstance(v, (int, float, str, bool))
+            }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        log.info("JSON exported: %s", path)
+
+
+# ─── RECENT FILES ─────────────────────────────────────────────────────────────
+
+def load_recent() -> List[str]:
+    try:
+        if RECENT_FILE.exists():
+            data = json.loads(RECENT_FILE.read_text(encoding="utf-8"))
+            return [p for p in data.get("files", []) if Path(p).exists()]
+    except Exception:
+        pass
+    return []
+
+
+def save_recent(files: List[str]):
+    try:
+        RECENT_FILE.write_text(
+            json.dumps({"files": files[:MAX_RECENT]}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def add_recent(path: str, files: List[str]) -> List[str]:
+    files = [f for f in files if f != path]
+    files.insert(0, path)
+    return files[:MAX_RECENT]
+
+
 # ─── LANGUAGE STRINGS ─────────────────────────────────────────────────────────
-LANG = {
+LANG: Dict[str, Dict[str, str]] = {
     "TR": {
-        # Topbar
-        "app_name":        "MEMBRANE SCIENCE ANALYZER",
-        "app_sub":         "SEM / TEM  \u00b7  Porozite \u00b7 Fouling \u00b7 Aktif Bolge",
+        "app_sub":         "SEM / TEM  ·  Porozite · Fouling · Aktif Bölge",
         "status_ready":    "HAZIR",
         "status_analyzing":"Analiz ediliyor...",
-        "status_done":     "Analiz tamamlandi \u2713",
-        "status_error":    "Hata olustu!",
-        "status_reset":    "Sifirlanadi.",
+        "status_done":     "Analiz tamamlandı ✓",
+        "status_error":    "Hata oluştu!",
+        "status_reset":    "Sıfırlandı.",
         "lang_btn":        "EN",
-        # Sidebar sections
-        "sec_image":       "GORUNTU GIRISI",
-        "sec_mode":        "ANALIZ MODU",
+        "sec_image":       "GÖRÜNTÜ GİRİŞİ",
+        "sec_mode":        "ANALİZ MODU",
         "sec_params":      "PARAMETRELER",
-        "sec_actions":     "ISLEMLER",
-        # Image input
-        "lbl_img1":        "Birincil Goruntu",
-        "lbl_img2":        "Karsilastirma Goruntusu",
-        "btn_open":        "Ac",
-        # Modes
+        "sec_actions":     "İŞLEMLER",
+        "sec_scale":       "ÖLÇEK KALİBRASYONU",
+        "lbl_img1":        "Birincil Görüntü",
+        "lbl_img2":        "Karşılaştırma Görüntüsü",
+        "lbl_scale":       "px / µm (0 = px birimi)",
+        "btn_open":        "Aç",
         "mode_por":        "Porozite Analizi",
-        "mode_foul":       "Fouling Katmani",
-        "mode_sites":      "Aktif Bolge / Katalizor",
-        "mode_comp":       "Karsilastirmali Analiz",
-        # Parameters
-        "lbl_thresh":      "Esikleme Yontemi",
-        "lbl_minpore":     "Min. Gozenek Boyutu",
-        "lbl_side":        "Fouling Yonu",
-        "lbl_cluster":     "K-Means Kume Sayisi",
-        # Actions
-        "btn_run":         "  \u25b6   ANALIZI CALISTIR",
-        "btn_csv":         "  Disari Aktar  \u2014  CSV",
-        "btn_pdf":         "  Disari Aktar  \u2014  PDF",
-        "btn_reset":       "  Sifirla",
-        "sb_hint":         "Goruntu yukleyin ve analiz modunu secin.",
-        # Tabs
-        "tab_results":     "  Sonuclar  ",
+        "mode_foul":       "Fouling Katmanı",
+        "mode_sites":      "Aktif Bölge / Katalizör",
+        "mode_comp":       "Karşılaştırmalı Analiz",
+        "lbl_thresh":      "Eşikleme Yöntemi",
+        "lbl_minpore":     "Min. Gözenek Boyutu (px)",
+        "lbl_side":        "Fouling Yönü",
+        "lbl_cluster":     "K-Means Küme Sayısı",
+        "btn_run":         "  ▶   ANALİZİ ÇALIŞTIR",
+        "btn_csv":         "  Dışarı Aktar — CSV",
+        "btn_json":        "  Dışarı Aktar — JSON",
+        "btn_pdf":         "  Dışarı Aktar — PDF",
+        "btn_reset":       "  Sıfırla",
+        "sb_hint":         "Görüntü yükleyin ve analiz modunu seçin.",
+        "remind_rerun":    "⚠  Parametreler değişti — yeniden çalıştırın",
+        "tab_results":     "  Sonuçlar  ",
         "tab_charts":      "  Grafikler  ",
-        "tab_log":         "  Is Gecmisi  ",
-        # Metric cards
+        "tab_log":         "  İş Geçmişi  ",
         "mc_porosity":     "Porozite",
-        "mc_pores":        "Gozenek",
-        "mc_diam":         "Ort. Cap",
+        "mc_pores":        "Gözenek",
+        "mc_diam":         "Ort. Çap",
         "mc_fouling":      "Fouling Kal.",
-        # Result headers
-        "hdr_por":         "POROZITE ANALIZI",
-        "hdr_psd":         "GOZENEK BOYUT DAGILIMI",
-        "hdr_foul":        "FOULING KATMANI ANALIZI",
-        "hdr_int":         "YOGUNLUK ANALIZI",
-        "hdr_sites":       "AKTIF BOLGE / KATALIZOR ANALIZI",
+        "hdr_por":         "POROZİTE ANALİZİ",
+        "hdr_psd":         "GÖZENEK BOYUT DAĞILIMI",
+        "hdr_psd_pct":     "YÜZDELİKLER",
+        "hdr_foul":        "FOULING KATMANI ANALİZİ",
+        "hdr_int":         "YOĞUNLUK & SİNYAL",
+        "hdr_sites":       "AKTİF BÖLGE ANALİZİ",
         "hdr_cov":         "KAPLAMA ORANI",
-        "hdr_comp":        "KARSILASTIRMALI ANALIZ",
-        "hdr_cnt":         "GOZENEK SAYISI & CAPI",
-        # Result keys
-        "k_method":        "Esikleme Yontemi:",
+        "hdr_comp":        "KARŞILAŞTIRMALI ANALİZ",
+        "hdr_cnt":         "GÖZENEK SAYISI & ÇAPI",
+        "k_method":        "Eşikleme Yöntemi:",
         "k_porosity":      "Porozite (%):",
-        "k_pore_count":    "Toplam Gozenek:",
-        "k_mean_diam":     "Ort. Esdeger Cap (px):",
+        "k_pore_count":    "Toplam Gözenek:",
+        "k_mean_diam":     "Ort. Eşdeğer Çap (px):",
+        "k_mean_diam_um":  "Ort. Eşdeğer Çap (µm):",
         "k_std_diam":      "Std. Sapma (px):",
-        "k_min_diam":      "Min. Cap (px):",
-        "k_max_diam":      "Max. Cap (px):",
+        "k_min_diam":      "Min. Çap (px):",
+        "k_max_diam":      "Max. Çap (px):",
+        "k_d10":           "D10 (px):",
+        "k_d50":           "D50 / Medyan (px):",
+        "k_d90":           "D90 (px):",
         "k_eccentric":     "Ort. Eksantriklik:",
-        "k_side":          "Fouling Yonu:",
-        "k_interface":     "Arayuz (px satir):",
-        "k_f_px":          "Fouling Kalinligi (px):",
-        "k_f_pct":         "Fouling Kalinligi (%):",
-        "k_l_int":         "Fouling Ort. Yogunluk:",
-        "k_m_int":         "Membran Ort. Yogunluk:",
-        "k_contrast":      "Kontrast (sigma):",
-        "k_k":             "K-Means Kume Sayisi:",
-        "k_bright_cnt":    "Parlak Bolge Sayisi:",
-        "k_dark_cnt":      "Koyu Bolge Sayisi:",
-        "k_total_cnt":     "Toplam Aktif Bolge:",
+        "k_side":          "Fouling Yönü:",
+        "k_interface":     "Arayüz (px satır):",
+        "k_f_px":          "Fouling Kalınlığı (px):",
+        "k_f_pct":         "Fouling Kalınlığı (%):",
+        "k_l_int":         "Fouling Ort. Yoğunluk:",
+        "k_m_int":         "Membran Ort. Yoğunluk:",
+        "k_contrast":      "Kontrast (σ):",
+        "k_snr":           "SNR (dB):",
+        "k_k":             "K-Means Küme Sayısı:",
+        "k_bright_cnt":    "Parlak Bölge Sayısı:",
+        "k_dark_cnt":      "Koyu Bölge Sayısı:",
+        "k_total_cnt":     "Toplam Aktif Bölge:",
         "k_bright_cov":    "Parlak Kaplama (%):",
         "k_dark_cov":      "Koyu Kaplama (%):",
         "k_total_cov":     "Toplam Kaplama (%):",
-        "k_img1_por":      "Goruntu 1 Porozite (%):",
-        "k_img2_por":      "Goruntu 2 Porozite (%):",
+        "k_img1_por":      "Görüntü 1 Porozite (%):",
+        "k_img2_por":      "Görüntü 2 Porozite (%):",
         "k_delta":         "Delta Porozite (G2-G1):",
-        "k_img1_cnt":      "G1 Gozenek Sayisi:",
-        "k_img2_cnt":      "G2 Gozenek Sayisi:",
-        "k_img1_diam":     "G1 Ort. Cap (px):",
-        "k_img2_diam":     "G2 Ort. Cap (px):",
-        # Chart titles
-        "ct_mask":         "Gozenek Maskesi",
-        "ct_psd":          "Boyut Dagilimi",
-        "ct_edge":         "Kenar Haritasi + Arayuz",
-        "ct_profile":      "Yogunluk Profili",
+        "k_img1_cnt":      "G1 Gözenek Sayısı:",
+        "k_img2_cnt":      "G2 Gözenek Sayısı:",
+        "k_img1_diam":     "G1 Ort. Çap (px):",
+        "k_img2_diam":     "G2 Ort. Çap (px):",
+        "ct_mask":         "Gözenek Maskesi",
+        "ct_psd":          "Boyut Dağılımı",
+        "ct_edge":         "Kenar Haritası + Arayüz",
+        "ct_profile":      "Yoğunluk Profili",
         "ct_norm":         "Normalize",
         "ct_bright":       "Parlak",
         "ct_dark":         "Koyu",
-        "ct_por_cmp":      "Porozite Karsilastirmasi",
-        "ct_cnt_cmp":      "Gozenek Sayisi Kars.",
-        "ax_diam":         "Esdeger Cap (px)",
-        "ax_count":        "Sayi",
-        "ax_intensity":    "Ort. Yogunluk",
-        "ax_row":          "Satir (px)",
+        "ct_kmeans":       "K-Means Segmentasyonu",
+        "ct_por_cmp":      "Porozite Karşılaştırması",
+        "ct_cnt_cmp":      "Gözenek Sayısı Kars.",
+        "ax_diam":         "Eşdeğer Çap (px)",
+        "ax_count":        "Sayı",
+        "ax_intensity":    "Ort. Yoğunluk",
+        "ax_row":          "Satır (px)",
         "ax_porosity":     "Porozite (%)",
-        "ax_pore_count":   "Gozenek Sayisi",
-        "ax_interface":    "Arayuz",
-        "lbl_img1_bar":    "Goruntu 1",
-        "lbl_img2_bar":    "Goruntu 2",
-        # Placeholder
-        "ph_line1":        "Goruntu yuklemek icin soldaki 'Ac' butonunu kullanin",
-        "ph_line2":        "PNG  \u00b7  JPG  \u00b7  TIF  \u00b7  BMP  \u00b7  AVIF  \u00b7  WEBP",
-        # Dialogs
-        "dlg_no_img":      "Goruntu Yok",
-        "dlg_no_img_msg":  "Lutfen once bir goruntu secin.",
-        "dlg_two_img":     "Iki Goruntu Gerekli",
-        "dlg_two_img_msg": "Karsilastirma modu icin her iki goruntu de secilmeli.",
+        "ax_pore_count":   "Gözenek Sayısı",
+        "ax_interface":    "Arayüz",
+        "lbl_img1_bar":    "Görüntü 1",
+        "lbl_img2_bar":    "Görüntü 2",
+        "ph_line1":        "Görüntü yüklemek için 'Aç' butonunu kullanın",
+        "ph_line2":        "PNG · JPG · TIF · BMP · AVIF · WEBP",
+        "ph_line3":        "veya dosyayı buraya sürükleyip bırakın",
+        "dlg_no_img":      "Görüntü Yok",
+        "dlg_no_img_msg":  "Lütfen önce bir görüntü seçin.",
+        "dlg_two_img":     "İki Görüntü Gerekli",
+        "dlg_two_img_msg": "Karşılaştırma modu için her iki görüntü de seçilmeli.",
         "dlg_no_data":     "Veri Yok",
-        "dlg_no_data_msg": "Once bir analiz calistirin.",
+        "dlg_no_data_msg": "Önce bir analiz çalıştırın.",
         "dlg_pkg":         "Eksik Paket",
         "dlg_pkg_msg":     "pip install reportlab",
-        "dlg_exported":    "Disari Aktarildi",
+        "dlg_exported":    "Dışarı Aktarıldı",
         "dlg_csv_done":    "CSV kaydedildi:\n",
+        "dlg_json_done":   "JSON kaydedildi:\n",
         "dlg_pdf_done":    "PDF kaydedildi:\n",
-        "dlg_err":         "Analiz Hatasi",
-        # Log messages
-        "log_loaded":      "Yuklendi: ",
-        "log_cmp_loaded":  "Karsilastirma yuklendi: ",
-        "log_done":        " analizi tamamlandi.",
+        "dlg_err":         "Analiz Hatası",
+        "log_loaded":      "Yüklendi: ",
+        "log_cmp_loaded":  "Karşılaştırma yüklendi: ",
+        "log_done":        " analizi tamamlandı.",
         "log_err":         "HATA: ",
         "log_csv":         "CSV kaydedildi: ",
+        "log_json":        "JSON kaydedildi: ",
         "log_pdf":         "PDF kaydedildi: ",
-        "log_reset":       "Uygulama sifirlanadi.",
-        "log_prev_err":    "Preview hatasi: ",
-        # Result default
-        "rt_default1":     "\n  Henuz analiz yapilmadi.\n",
-        "rt_default2":     "  Goruntu yukleyin ve analiz modunu secin.\n",
-        # PDF
-        "pdf_title":       "Membrane Science Analyzer - Analiz Raporu",
-        "pdf_module":      "Modul: ",
+        "log_reset":       "Uygulama sıfırlandı.",
+        "log_prev_err":    "Önizleme hatası: ",
+        "rt_default1":     "\n  Henüz analiz yapılmadı.\n",
+        "rt_default2":     "  Görüntü yükleyin ve analiz modunu seçin.\n",
+        "pdf_title":       "Membrane Science Analyzer v2 — Analiz Raporu",
+        "pdf_module":      "Modül: ",
         "pdf_param":       "Parametre",
-        "pdf_value":       "Deger",
-        # CSV header
+        "pdf_value":       "Değer",
         "csv_param":       "Parametre",
-        "csv_value":       "Deger",
-        "csv_module":      "Modul",
-        # Browse dialog
-        "browse_primary":  "SEM/TEM Goruntusu Sec",
-        "browse_compare":  "Karsilastirma Goruntusu Sec",
-        "browse_ftypes":   "Goruntu Dosyalari",
+        "csv_value":       "Değer",
+        "csv_module":      "Modül",
+        "browse_primary":  "SEM/TEM Görüntüsü Seç",
+        "browse_compare":  "Karşılaştırma Görüntüsü Seç",
+        "browse_ftypes":   "Görüntü Dosyaları",
+        "menu_file":       "Dosya",
+        "menu_open":       "Aç...                Ctrl+O",
+        "menu_recent":     "Son Dosyalar",
+        "menu_reset":      "Sıfırla              Ctrl+Z",
+        "menu_run":        "Analizi Çalıştır         F5",
+        "menu_csv":        "CSV Dışarı Aktar  Ctrl+S",
+        "menu_json":       "JSON Dışarı Aktar",
+        "menu_pdf":        "PDF Dışarı Aktar  Ctrl+Shift+S",
+        "menu_quit":       "Çıkış",
+        "zoom_hint":       "Fare tekerleği: zoom  |  Sürükle: kaydır  |  Çift tıkla: sıfırla",
     },
     "EN": {
-        "app_name":        "MEMBRANE SCIENCE ANALYZER",
-        "app_sub":         "SEM / TEM  \u00b7  Porosity \u00b7 Fouling \u00b7 Active Sites",
+        "app_sub":         "SEM / TEM  ·  Porosity · Fouling · Active Sites",
         "status_ready":    "READY",
         "status_analyzing":"Analyzing...",
-        "status_done":     "Analysis complete \u2713",
+        "status_done":     "Analysis complete ✓",
         "status_error":    "Error occurred!",
         "status_reset":    "Reset complete.",
         "lang_btn":        "TR",
@@ -223,22 +709,26 @@ LANG = {
         "sec_mode":        "ANALYSIS MODE",
         "sec_params":      "PARAMETERS",
         "sec_actions":     "ACTIONS",
+        "sec_scale":       "SCALE CALIBRATION",
         "lbl_img1":        "Primary Image",
         "lbl_img2":        "Comparison Image",
+        "lbl_scale":       "px / µm  (0 = pixel units)",
         "btn_open":        "Open",
         "mode_por":        "Porosity Analysis",
         "mode_foul":       "Fouling Layer",
         "mode_sites":      "Active Sites / Catalyst",
         "mode_comp":       "Comparative Analysis",
         "lbl_thresh":      "Threshold Method",
-        "lbl_minpore":     "Min. Pore Size",
+        "lbl_minpore":     "Min. Pore Size (px)",
         "lbl_side":        "Fouling Side",
         "lbl_cluster":     "K-Means Cluster Count",
-        "btn_run":         "  \u25b6   RUN ANALYSIS",
-        "btn_csv":         "  Export  \u2014  CSV",
-        "btn_pdf":         "  Export  \u2014  PDF",
+        "btn_run":         "  ▶   RUN ANALYSIS",
+        "btn_csv":         "  Export — CSV",
+        "btn_json":        "  Export — JSON",
+        "btn_pdf":         "  Export — PDF",
         "btn_reset":       "  Reset",
         "sb_hint":         "Load an image and select an analysis mode.",
+        "remind_rerun":    "⚠  Parameters changed — re-run analysis",
         "tab_results":     "  Results  ",
         "tab_charts":      "  Charts  ",
         "tab_log":         "  Activity Log  ",
@@ -248,9 +738,10 @@ LANG = {
         "mc_fouling":      "Fouling Thick.",
         "hdr_por":         "POROSITY ANALYSIS",
         "hdr_psd":         "PORE SIZE DISTRIBUTION",
+        "hdr_psd_pct":     "PERCENTILES",
         "hdr_foul":        "FOULING LAYER ANALYSIS",
-        "hdr_int":         "INTENSITY ANALYSIS",
-        "hdr_sites":       "ACTIVE SITE / CATALYST ANALYSIS",
+        "hdr_int":         "INTENSITY & SIGNAL",
+        "hdr_sites":       "ACTIVE SITE ANALYSIS",
         "hdr_cov":         "COVERAGE",
         "hdr_comp":        "COMPARATIVE ANALYSIS",
         "hdr_cnt":         "PORE COUNT & DIAMETER",
@@ -258,9 +749,13 @@ LANG = {
         "k_porosity":      "Porosity (%):",
         "k_pore_count":    "Total Pore Count:",
         "k_mean_diam":     "Mean Equiv. Diameter (px):",
+        "k_mean_diam_um":  "Mean Equiv. Diameter (µm):",
         "k_std_diam":      "Std. Deviation (px):",
         "k_min_diam":      "Min. Diameter (px):",
         "k_max_diam":      "Max. Diameter (px):",
+        "k_d10":           "D10 (px):",
+        "k_d50":           "D50 / Median (px):",
+        "k_d90":           "D90 (px):",
         "k_eccentric":     "Mean Eccentricity:",
         "k_side":          "Fouling Side:",
         "k_interface":     "Interface (row px):",
@@ -268,7 +763,8 @@ LANG = {
         "k_f_pct":         "Fouling Thickness (%):",
         "k_l_int":         "Fouling Mean Intensity:",
         "k_m_int":         "Membrane Mean Intensity:",
-        "k_contrast":      "Contrast (sigma):",
+        "k_contrast":      "Contrast (σ):",
+        "k_snr":           "SNR (dB):",
         "k_k":             "K-Means Cluster Count:",
         "k_bright_cnt":    "Bright Site Count:",
         "k_dark_cnt":      "Dark Site Count:",
@@ -290,6 +786,7 @@ LANG = {
         "ct_norm":         "Normalized",
         "ct_bright":       "Bright",
         "ct_dark":         "Dark",
+        "ct_kmeans":       "K-Means Segmentation",
         "ct_por_cmp":      "Porosity Comparison",
         "ct_cnt_cmp":      "Pore Count Comparison",
         "ax_diam":         "Equiv. Diameter (px)",
@@ -302,7 +799,8 @@ LANG = {
         "lbl_img1_bar":    "Image 1",
         "lbl_img2_bar":    "Image 2",
         "ph_line1":        "Use the 'Open' button on the left to load an image",
-        "ph_line2":        "PNG  \u00b7  JPG  \u00b7  TIF  \u00b7  BMP  \u00b7  AVIF  \u00b7  WEBP",
+        "ph_line2":        "PNG · JPG · TIF · BMP · AVIF · WEBP",
+        "ph_line3":        "or drag & drop a file here",
         "dlg_no_img":      "No Image",
         "dlg_no_img_msg":  "Please select an image first.",
         "dlg_two_img":     "Two Images Required",
@@ -313,6 +811,7 @@ LANG = {
         "dlg_pkg_msg":     "pip install reportlab",
         "dlg_exported":    "Exported",
         "dlg_csv_done":    "CSV saved:\n",
+        "dlg_json_done":   "JSON saved:\n",
         "dlg_pdf_done":    "PDF saved:\n",
         "dlg_err":         "Analysis Error",
         "log_loaded":      "Loaded: ",
@@ -320,12 +819,13 @@ LANG = {
         "log_done":        " analysis complete.",
         "log_err":         "ERROR: ",
         "log_csv":         "CSV saved: ",
+        "log_json":        "JSON saved: ",
         "log_pdf":         "PDF saved: ",
         "log_reset":       "Application reset.",
         "log_prev_err":    "Preview error: ",
         "rt_default1":     "\n  No analysis has been run yet.\n",
         "rt_default2":     "  Load an image and select an analysis mode.\n",
-        "pdf_title":       "Membrane Science Analyzer - Analysis Report",
+        "pdf_title":       "Membrane Science Analyzer v2 — Analysis Report",
         "pdf_module":      "Module: ",
         "pdf_param":       "Parameter",
         "pdf_value":       "Value",
@@ -335,145 +835,18 @@ LANG = {
         "browse_primary":  "Select SEM/TEM Image",
         "browse_compare":  "Select Comparison Image",
         "browse_ftypes":   "Image Files",
+        "menu_file":       "File",
+        "menu_open":       "Open...              Ctrl+O",
+        "menu_recent":     "Recent Files",
+        "menu_reset":      "Reset                Ctrl+Z",
+        "menu_run":        "Run Analysis             F5",
+        "menu_csv":        "Export CSV           Ctrl+S",
+        "menu_json":       "Export JSON",
+        "menu_pdf":        "Export PDF    Ctrl+Shift+S",
+        "menu_quit":       "Quit",
+        "zoom_hint":       "Scroll: zoom  |  Drag: pan  |  Double-click: reset",
     }
 }
-
-
-# ─── ANALYSIS ENGINE ──────────────────────────────────────────────────────────
-
-class AnalysisEngine:
-    def __init__(self):
-        self.original = None
-        self.gray     = None
-        self.results  = {}
-        self.img_path = None
-
-    def load_image(self, path):
-        img = cv2.imread(path)
-        if img is None:
-            try:
-                pil = Image.open(path).convert("RGB")
-                img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                raise ValueError(f"Cannot load image: {path}\n({e})")
-        if img is None:
-            raise ValueError(f"Cannot load image: {path}")
-        self.original = img
-        self.gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        self.img_path = path
-        return img
-
-    def analyze_porosity(self, method="otsu", min_pore_px=10):
-        g = self.gray.copy()
-        if method == "otsu":
-            thresh, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        elif method == "adaptive":
-            mask   = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                           cv2.THRESH_BINARY_INV, 31, 5)
-            thresh = None
-        elif method == "triangle":
-            thresh, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_TRIANGLE)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-        kernel     = np.ones((3, 3), np.uint8)
-        mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-        labeled    = measure.label(mask_clean)
-        props      = [p for p in measure.regionprops(labeled) if p.area >= min_pore_px]
-        valid_mask = np.zeros_like(mask_clean)
-        for p in props: valid_mask[labeled == p.label] = 255
-        areas      = np.array([p.area for p in props])
-        diameters  = 2 * np.sqrt(areas / np.pi) if len(areas) else np.array([])
-        eccs       = np.array([p.eccentricity for p in props])
-        result = {
-            "method":         method,
-            "threshold":      thresh if thresh is not None else "adaptive",
-            "porosity_pct":   round(int(np.sum(valid_mask > 0)) / g.size * 100, 3),
-            "pore_count":     len(props),
-            "mean_diam_px":   round(float(np.mean(diameters)) if len(diameters) else 0, 2),
-            "std_diam_px":    round(float(np.std(diameters))  if len(diameters) else 0, 2),
-            "max_diam_px":    round(float(np.max(diameters))  if len(diameters) else 0, 2),
-            "min_diam_px":    round(float(np.min(diameters))  if len(diameters) else 0, 2),
-            "mean_eccentric": round(float(np.mean(eccs))      if len(eccs)       else 0, 3),
-            "mask":           valid_mask, "props": props,
-            "areas": areas, "diameters": diameters,
-        }
-        self.results["porosity"] = result
-        return result
-
-    def analyze_fouling(self, layer_side="top"):
-        g    = self.gray.copy()
-        h, w = g.shape
-        profile     = np.mean(g, axis=1) if layer_side in ("top","bottom") else np.mean(g, axis=0)
-        sobelx      = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=5)
-        sobely      = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=5)
-        edge_map    = np.sqrt(sobelx**2 + sobely**2)
-        canny_edges = canny(g.astype(float) / 255.0, sigma=2.0)
-        smooth_grad = ndimage.gaussian_filter1d(np.abs(np.gradient(profile)), sigma=5)
-        if layer_side == "top":
-            idx = int(np.argmax(smooth_grad[:h//2])); thick = idx
-        elif layer_side == "bottom":
-            idx = h - int(np.argmax(smooth_grad[h//2:][::-1])) - 1; thick = h - idx
-        else:
-            idx = int(np.argmax(smooth_grad)); thick = idx
-        lr = g[:idx, :] if layer_side == "top" else g[idx:, :]
-        mr = g[idx:, :] if layer_side == "top" else g[:idx, :]
-        result = {
-            "layer_side":              layer_side,
-            "interface_row_px":        idx,
-            "fouling_thickness_px":    thick,
-            "fouling_thickness_pct":   round(thick / h * 100, 2),
-            "layer_mean_intensity":    round(float(np.mean(lr)), 2) if lr.size else 0,
-            "membrane_mean_intensity": round(float(np.mean(mr)), 2) if mr.size else 0,
-            "contrast_ratio":          round(float(np.std(g)), 3),
-            "profile": profile, "smooth_grad": smooth_grad,
-            "edge_map": edge_map, "canny_edges": canny_edges,
-        }
-        self.results["fouling"] = result
-        return result
-
-    def analyze_active_sites(self, cluster_count=5, min_area=5):
-        g      = self.gray.copy()
-        g8     = (exposure.equalize_adapthist(g, clip_limit=0.03) * 255).astype(np.uint8)
-        bm     = (g8 >= int(np.percentile(g8, 90))).astype(np.uint8) * 255
-        dm     = (g8 <= int(np.percentile(g8, 10))).astype(np.uint8) * 255
-        def extract(mask):
-            c = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
-            l = measure.label(c)
-            return [p for p in measure.regionprops(l) if p.area >= min_area], c
-        bp, bc = extract(bm); dp, dc = extract(dm)
-        pixels = g8.reshape(-1,1).astype(np.float32)
-        k = min(cluster_count, 8)
-        _, lk, centers = cv2.kmeans(pixels, k, None,
-            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 0.1),
-            10, cv2.KMEANS_RANDOM_CENTERS)
-        result = {
-            "cluster_count":       k,
-            "bright_site_count":   len(bp),
-            "dark_site_count":     len(dp),
-            "total_site_count":    len(bp) + len(dp),
-            "bright_coverage_pct": round(float(np.sum(bc>0)) / g.size * 100, 3),
-            "dark_coverage_pct":   round(float(np.sum(dc>0)) / g.size * 100, 3),
-            "bright_props": bp, "dark_props": dp,
-            "bright_mask": bc, "dark_mask": dc,
-            "centers": centers, "g_norm": g8,
-        }
-        self.results["active_sites"] = result
-        return result
-
-    def compare_images(self, p1, p2, method="otsu"):
-        e1, e2 = AnalysisEngine(), AnalysisEngine()
-        e1.load_image(p1); e2.load_image(p2)
-        r1 = e1.analyze_porosity(method); r2 = e2.analyze_porosity(method)
-        return {
-            "img1_porosity":   r1["porosity_pct"],
-            "img2_porosity":   r2["porosity_pct"],
-            "delta_porosity":  round(r2["porosity_pct"] - r1["porosity_pct"], 3),
-            "img1_pore_count": r1["pore_count"],
-            "img2_pore_count": r2["pore_count"],
-            "img1_mean_diam":  r1["mean_diam_px"],
-            "img2_mean_diam":  r2["mean_diam_px"],
-            "r1": r1, "r2": r2,
-        }
 
 
 # ─── UI COMPONENTS ────────────────────────────────────────────────────────────
@@ -488,18 +861,19 @@ class MetricCard(tk.Frame):
         super().__init__(parent, bg=C["bg_card"],
                          highlightbackground=C["border"], highlightthickness=1, **kw)
         self._accent = accent or C["teal"]
-        self._top_bar = tk.Frame(self, bg=self._accent, height=2)
-        self._top_bar.pack(fill="x")
+        tk.Frame(self, bg=self._accent, height=2).pack(fill="x")
         inner = tk.Frame(self, bg=C["bg_card"])
         inner.pack(fill="both", expand=True, padx=12, pady=8)
         self._var   = tk.StringVar(value="--")
         self._lbl_v = tk.Label(inner, textvariable=self._var,
-                               font=(F_NUM,15,"bold"), fg=C["text_hi"], bg=C["bg_card"])
+                               font=(F_NUM, 15, "bold"), fg=C["text_hi"], bg=C["bg_card"])
         self._lbl_v.pack(anchor="w")
-        self._lbl_u = tk.Label(inner, text=unit, font=FT["small"], fg=self._accent, bg=C["bg_card"])
+        self._lbl_u = tk.Label(inner, text=unit, font=FT["small"],
+                               fg=self._accent, bg=C["bg_card"])
         self._lbl_u.pack(anchor="w")
-        self._lbl_l = tk.Label(inner, text=label, font=FT["small"], fg=C["text_lo"], bg=C["bg_card"])
-        self._lbl_l.pack(anchor="w", pady=(3,0))
+        self._lbl_l = tk.Label(inner, text=label, font=FT["small"],
+                               fg=C["text_lo"], bg=C["bg_card"])
+        self._lbl_l.pack(anchor="w", pady=(3, 0))
 
     def set(self, v):
         self._var.set(str(v))
@@ -519,14 +893,92 @@ class ScrollFrame(tk.Frame):
         self._sb.pack(side="right", fill="y")
         self._cv.pack(side="left", fill="both", expand=True)
         self.inner = tk.Frame(self._cv, bg=bg)
-        self._win  = self._cv.create_window((0,0), window=self.inner, anchor="nw")
+        self._win  = self._cv.create_window((0, 0), window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", lambda e: self._cv.configure(
             scrollregion=self._cv.bbox("all")))
         self._cv.bind("<Configure>", lambda e: self._cv.itemconfig(
             self._win, width=e.width))
         for w in (self._cv, self.inner):
             w.bind("<MouseWheel>", lambda e: self._cv.yview_scroll(
-                int(-1*(e.delta/120)), "units"))
+                int(-1 * (e.delta / 120)), "units"))
+
+
+class ZoomCanvas(tk.Canvas):
+    """Canvas with mouse-wheel zoom and drag-to-pan. Double-click resets view."""
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, **kw)
+        self._zoom      = 1.0
+        self._pan_x     = 0
+        self._pan_y     = 0
+        self._drag_start: Optional[Tuple[int, int]] = None
+        self._img_id    = None
+        self._pil_orig:  Optional[Image.Image] = None
+        self._tk_ref    = None
+
+        self.bind("<MouseWheel>",     self._on_wheel)
+        self.bind("<Button-4>",       self._on_wheel)    # Linux scroll up
+        self.bind("<Button-5>",       self._on_wheel)    # Linux scroll down
+        self.bind("<ButtonPress-1>",  self._drag_start_ev)
+        self.bind("<B1-Motion>",      self._drag_move)
+        self.bind("<ButtonRelease-1>",self._drag_end)
+        self.bind("<Double-Button-1>",self._reset_view)
+        self.bind("<Configure>",      self._on_resize)
+
+    def show_pil(self, pil: Image.Image):
+        self._pil_orig = pil.copy()
+        self._zoom     = 1.0
+        self._pan_x    = 0
+        self._pan_y    = 0
+        self._render()
+
+    def _render(self):
+        if self._pil_orig is None:
+            return
+        cw = self.winfo_width()  or 800
+        ch = self.winfo_height() or 400
+        iw = max(1, int(self._pil_orig.width  * self._zoom))
+        ih = max(1, int(self._pil_orig.height * self._zoom))
+        resized     = self._pil_orig.resize((iw, ih), Image.LANCZOS)
+        self._tk_ref = ImageTk.PhotoImage(resized)
+        self.delete("all")
+        cx = cw // 2 + self._pan_x
+        cy = ch // 2 + self._pan_y
+        self._img_id = self.create_image(cx, cy, image=self._tk_ref, anchor="center")
+
+    def _on_wheel(self, e):
+        if self._pil_orig is None:
+            return
+        delta = getattr(e, "delta", 0)
+        if e.num == 4:
+            delta = 120
+        elif e.num == 5:
+            delta = -120
+        factor = 1.1 if delta > 0 else 0.9
+        self._zoom = max(0.1, min(self._zoom * factor, 20.0))
+        self._render()
+
+    def _drag_start_ev(self, e):
+        self._drag_start = (e.x, e.y)
+
+    def _drag_move(self, e):
+        if self._drag_start and self._pil_orig:
+            dx = e.x - self._drag_start[0]
+            dy = e.y - self._drag_start[1]
+            self._pan_x += dx
+            self._pan_y += dy
+            self._drag_start = (e.x, e.y)
+            self._render()
+
+    def _drag_end(self, e):
+        self._drag_start = None
+
+    def _reset_view(self, e=None):
+        self._zoom, self._pan_x, self._pan_y = 1.0, 0, 0
+        self._render()
+
+    def _on_resize(self, e):
+        self._render()
 
 
 # ─── MAIN APPLICATION ─────────────────────────────────────────────────────────
@@ -534,123 +986,191 @@ class ScrollFrame(tk.Frame):
 class MembraneAnalyzerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self._lang    = "TR"           # aktif dil
-        self.engine   = AnalysisEngine()
+        self._lang   = "TR"
+        self.engine  = AnalysisEngine()
         self.img_path  = tk.StringVar()
         self.img_path2 = tk.StringVar()
-        self._tk_img   = None
+        self._recent: List[str] = load_recent()
+        self._params_dirty = False   # re-run reminder flag
 
-        self.title(f"Membrane Science Analyzer  |  SEM/TEM  v3.0")
-        self.geometry("1480x920")
+        self._dyn:         Dict[int, tuple] = {}
+        self._mode_labels: Dict[str, tk.Label]  = {}
+        self._mode_inds:   Dict[str, tk.Frame]  = {}
+
+        self.title(f"Membrane Science Analyzer  |  SEM/TEM  v{APP_VERSION}")
+        self.geometry("1520x940")
         self.minsize(1100, 720)
         self.configure(bg=C["bg_root"])
         self.resizable(True, True)
 
-        # Dinamik widget referansları — dil değişiminde güncellenir
-        self._dyn = {}          # key -> (widget, config_key, attr)
-        self._mode_labels = {}  # mode_val -> label_widget
-        self._mode_inds   = {}  # mode_val -> indicator frame
-
         self._build()
         self._apply_ttk()
+        self._bind_shortcuts()
+        self._bind_dnd()
 
-    # ── i18n shorthand ────────────────────────────────────────────────────────
-    def t(self, key):
+        self.after(50, lambda: self.mode_var.set(self.mode_var.get()))
+
+    # ── i18n ──────────────────────────────────────────────────────────────────
+    def t(self, key: str) -> str:
         return LANG[self._lang].get(key, key)
 
-    def _i18n_reg(self, widget, attr, lang_key):
-        """Dil değişiminde güncellenecek widget'ları kaydet."""
+    def _i18n_reg(self, widget, attr: str, lang_key: str):
         self._dyn[id(widget)] = (widget, attr, lang_key)
 
     def _apply_lang(self):
-        """Tüm kayıtlı widget'ları mevcut dile göre güncelle."""
-        for wid, (widget, attr, key) in self._dyn.items():
+        for _, (widget, attr, key) in self._dyn.items():
             try:
                 widget.configure(**{attr: self.t(key)})
             except Exception:
                 pass
-        # Mode radio etiketleri
+        mode_key_map = {
+            "Porosity":     "mode_por",
+            "Fouling Layer":"mode_foul",
+            "Active Sites": "mode_sites",
+            "Comparison":   "mode_comp",
+        }
         for val, lbl_w in self._mode_labels.items():
-            key = {"Porosity":"mode_por","Fouling Layer":"mode_foul",
-                   "Active Sites":"mode_sites","Comparison":"mode_comp"}[val]
-            lbl_w.configure(text=self.t(key))
-        # Metrik kart etiketleri
+            lbl_w.configure(text=self.t(mode_key_map[val]))
         for k, (mc, lk, uk) in self._mc_meta.items():
             mc.relabel(self.t(lk), self.t(uk))
-        # Tab etiketleri
         self.nb.tab(self.tab_r, text=self.t("tab_results"))
         self.nb.tab(self.tab_c, text=self.t("tab_charts"))
         self.nb.tab(self.tab_l, text=self.t("tab_log"))
-        # Topbar subtitle & status
         self._sub_lbl.configure(text=self.t("app_sub"))
         self._status_lbl.configure(text=" " + self.t("status_ready"))
-        # Results default text
+        self._zoom_hint.configure(text=self.t("zoom_hint"))
         self._rt_default()
+        self._rebuild_recent_menu()
+        if not self.img_path.get():
+            self._placeholder()
 
     def _toggle_lang(self):
         self._lang = "EN" if self._lang == "TR" else "TR"
-        # Lang butonunun metnini de güncelle
         self._lang_btn.configure(text=self.t("lang_btn"))
         self._apply_lang()
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # BUILD
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─── KEYBOARD SHORTCUTS ───────────────────────────────────────────────────
+    def _bind_shortcuts(self):
+        self.bind("<Control-o>",         lambda e: self._browse1())
+        self.bind("<F5>",                lambda e: self._run())
+        self.bind("<Control-s>",         lambda e: self._export_csv())
+        self.bind("<Control-S>",         lambda e: self._export_pdf())
+        self.bind("<Control-z>",         lambda e: self._reset())
+        self.bind("<Control-r>",         lambda e: self._run())
 
+    # ─── DRAG & DROP ──────────────────────────────────────────────────────────
+    def _bind_dnd(self):
+        """Best-effort drag & drop via tkinterdnd2 or Tkinter internals."""
+        try:
+            from tkinterdnd2 import DND_FILES
+            self.img_canvas.drop_target_register(DND_FILES)
+            self.img_canvas.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            # Fallback: Windows shell drop target via Tkinter
+            try:
+                self.img_canvas.bind("<Drop>", self._on_drop)
+            except Exception:
+                pass
+
+    def _on_drop(self, event):
+        raw = getattr(event, "data", None) or str(event)
+        path = raw.strip().strip("{}")
+        if path:
+            self._load_file(path)
+
+    # ─── BUILD ────────────────────────────────────────────────────────────────
     def _build(self):
+        self._build_menu()
         self._build_topbar()
         body = tk.Frame(self, bg=C["bg_root"])
         body.pack(fill="both", expand=True)
         self._build_sidebar(body)
         self._build_main(body)
 
+    # ── MENU ──────────────────────────────────────────────────────────────────
+    def _build_menu(self):
+        self._menubar = tk.Menu(self, bg=C["bg_panel"], fg=C["text_md"],
+                                activebackground=C["bg_hover"],
+                                activeforeground=C["text_hi"],
+                                relief="flat", bd=0)
+        self.configure(menu=self._menubar)
+
+        self._file_menu = tk.Menu(self._menubar, tearoff=0,
+                                  bg=C["bg_panel"], fg=C["text_md"],
+                                  activebackground=C["blue_dim"],
+                                  activeforeground=C["text_hi"])
+        self._menubar.add_cascade(label=self.t("menu_file"), menu=self._file_menu)
+
+        self._file_menu.add_command(label=self.t("menu_open"),  command=self._browse1)
+        self._recent_menu = tk.Menu(self._file_menu, tearoff=0,
+                                    bg=C["bg_panel"], fg=C["text_md"],
+                                    activebackground=C["blue_dim"],
+                                    activeforeground=C["text_hi"])
+        self._file_menu.add_cascade(label=self.t("menu_recent"), menu=self._recent_menu)
+        self._rebuild_recent_menu()
+        self._file_menu.add_separator()
+        self._file_menu.add_command(label=self.t("menu_run"),   command=self._run)
+        self._file_menu.add_separator()
+        self._file_menu.add_command(label=self.t("menu_csv"),   command=self._export_csv)
+        self._file_menu.add_command(label=self.t("menu_json"),  command=self._export_json)
+        self._file_menu.add_command(label=self.t("menu_pdf"),   command=self._export_pdf)
+        self._file_menu.add_separator()
+        self._file_menu.add_command(label=self.t("menu_reset"), command=self._reset)
+        self._file_menu.add_separator()
+        self._file_menu.add_command(label=self.t("menu_quit"),  command=self.destroy)
+
+    def _rebuild_recent_menu(self):
+        self._recent_menu.delete(0, "end")
+        for p in self._recent:
+            label = Path(p).name
+            self._recent_menu.add_command(
+                label=label,
+                command=lambda path=p: self._load_file(path),
+            )
+        if not self._recent:
+            self._recent_menu.add_command(label="(boş)", state="disabled")
+
     # ── TOPBAR ────────────────────────────────────────────────────────────────
     def _build_topbar(self):
         bar = tk.Frame(self, bg=C["bg_panel"], height=48)
-        bar.pack(fill="x"); bar.pack_propagate(False)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
         tk.Frame(bar, bg=C["teal"], width=3).pack(side="left", fill="y")
 
-        tk.Label(bar, text="MEMBRANE", font=(F_UI,13,"bold"),
-                 fg=C["text_hi"], bg=C["bg_panel"]).pack(side="left", padx=(14,0))
-        tk.Label(bar, text=" SCIENCE ANALYZER",
-                 font=(F_UI,13), fg=C["teal"], bg=C["bg_panel"]).pack(side="left")
+        tk.Label(bar, text="MEMBRANE", font=(F_UI, 13, "bold"),
+                 fg=C["text_hi"], bg=C["bg_panel"]).pack(side="left", padx=(14, 0))
+        tk.Label(bar, text=" SCIENCE ANALYZER  v2",
+                 font=(F_UI, 13), fg=C["teal"], bg=C["bg_panel"]).pack(side="left")
         _sep(bar, vertical=True).pack(side="left", fill="y", padx=18, pady=12)
 
         self._sub_lbl = tk.Label(bar, text=self.t("app_sub"),
                                  font=FT["small"], fg=C["text_lo"], bg=C["bg_panel"])
         self._sub_lbl.pack(side="left")
 
-        # Sağ: Dil Butonu + Durum
         right = tk.Frame(bar, bg=C["bg_panel"])
         right.pack(side="right", padx=16)
 
-        # Dil değiştir butonu
         self._lang_btn = tk.Button(
-            right, text=self.t("lang_btn"),
-            command=self._toggle_lang,
-            bg=C["bg_input"], fg=C["blue"],
-            relief="flat", cursor="hand2",
-            font=(F_UI, 9, "bold"),
-            activebackground=C["blue_dim"],
-            activeforeground=C["text_hi"],
-            padx=10, pady=2)
-        self._lang_btn.pack(side="right", padx=(12,0))
+            right, text=self.t("lang_btn"), command=self._toggle_lang,
+            bg=C["bg_input"], fg=C["blue"], relief="flat", cursor="hand2",
+            font=(F_UI, 9, "bold"), activebackground=C["blue_dim"],
+            activeforeground=C["text_hi"], padx=10, pady=2)
+        self._lang_btn.pack(side="right", padx=(12, 0))
 
         _sep(right, vertical=True).pack(side="right", fill="y", pady=12, padx=8)
-
-        self._dot = tk.Label(right, text="\u25cf", font=FT["small"],
+        self._dot = tk.Label(right, text="●", font=FT["small"],
                              fg=C["teal"], bg=C["bg_panel"])
         self._dot.pack(side="right")
         self._status_lbl = tk.Label(right, text=" " + self.t("status_ready"),
                                     font=FT["small"], fg=C["text_lo"], bg=C["bg_panel"])
         self._status_lbl.pack(side="right")
-
         _sep(self).pack(fill="x")
 
     # ── SIDEBAR ───────────────────────────────────────────────────────────────
     def _build_sidebar(self, parent):
-        sb_outer = tk.Frame(parent, bg=C["bg_panel"], width=295)
-        sb_outer.pack(side="left", fill="y"); sb_outer.pack_propagate(False)
+        sb_outer = tk.Frame(parent, bg=C["bg_panel"], width=300)
+        sb_outer.pack(side="left", fill="y")
+        sb_outer.pack_propagate(False)
         _sep(sb_outer, vertical=True).pack(side="right", fill="y")
 
         sf = ScrollFrame(sb_outer, bg=C["bg_panel"])
@@ -660,12 +1180,11 @@ class MembraneAnalyzerApp(tk.Tk):
         # ── Image Input
         self._sh(p, "sec_image")
         self._sl(p, "lbl_img1")
-        r1 = tk.Frame(p, bg=C["bg_panel"]); r1.pack(fill="x", padx=10, pady=(2,8))
-        tk.Entry(r1, textvariable=self.img_path,
-                 bg=C["bg_input"], fg=C["text_md"],
-                 insertbackground=C["teal"], relief="flat",
-                 font=FT["mono_s"], bd=0
-                 ).pack(side="left", fill="x", expand=True, ipady=5, padx=(0,6))
+        r1 = tk.Frame(p, bg=C["bg_panel"])
+        r1.pack(fill="x", padx=10, pady=(2, 8))
+        tk.Entry(r1, textvariable=self.img_path, bg=C["bg_input"], fg=C["text_md"],
+                 insertbackground=C["teal"], relief="flat", font=FT["mono_s"], bd=0
+                 ).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
         b1 = tk.Button(r1, text=self.t("btn_open"), command=self._browse1,
                        bg=C["teal_dim"], fg=C["teal"], relief="flat", font=FT["small"],
                        cursor="hand2", activebackground=C["teal"],
@@ -674,18 +1193,28 @@ class MembraneAnalyzerApp(tk.Tk):
         self._i18n_reg(b1, "text", "btn_open")
 
         self._sl(p, "lbl_img2")
-        r2 = tk.Frame(p, bg=C["bg_panel"]); r2.pack(fill="x", padx=10, pady=(2,4))
-        tk.Entry(r2, textvariable=self.img_path2,
-                 bg=C["bg_input"], fg=C["text_md"],
-                 insertbackground=C["teal"], relief="flat",
-                 font=FT["mono_s"], bd=0
-                 ).pack(side="left", fill="x", expand=True, ipady=5, padx=(0,6))
+        r2 = tk.Frame(p, bg=C["bg_panel"])
+        r2.pack(fill="x", padx=10, pady=(2, 4))
+        tk.Entry(r2, textvariable=self.img_path2, bg=C["bg_input"], fg=C["text_md"],
+                 insertbackground=C["teal"], relief="flat", font=FT["mono_s"], bd=0
+                 ).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
         b2 = tk.Button(r2, text=self.t("btn_open"), command=self._browse2,
                        bg=C["bg_input"], fg=C["text_lo"], relief="flat", font=FT["small"],
                        cursor="hand2", activebackground=C["bg_hover"],
                        activeforeground=C["text_md"], padx=10)
         b2.pack(side="right", ipady=3)
         self._i18n_reg(b2, "text", "btn_open")
+
+        _sep(p).pack(fill="x", padx=10, pady=10)
+
+        # ── Scale Calibration
+        self._sh(p, "sec_scale")
+        self._sl(p, "lbl_scale")
+        self.scale_var = tk.DoubleVar(value=0.0)
+        scale_entry = tk.Entry(p, textvariable=self.scale_var, bg=C["bg_input"],
+                               fg=C["text_md"], insertbackground=C["teal"],
+                               relief="flat", font=FT["mono_s"], bd=0, width=10)
+        scale_entry.pack(fill="x", padx=10, ipady=5, pady=(2, 10))
 
         _sep(p).pack(fill="x", padx=10, pady=10)
 
@@ -707,10 +1236,10 @@ class MembraneAnalyzerApp(tk.Tk):
         self._sh(p, "sec_params")
         self._sl(p, "lbl_thresh")
         self.thresh_var = tk.StringVar(value="otsu")
-        ttk.Combobox(p, textvariable=self.thresh_var,
-                     values=["otsu","adaptive","triangle"],
-                     state="readonly", font=FT["body"]
-                     ).pack(fill="x", padx=10, pady=(2,10))
+        cb_thresh = ttk.Combobox(p, textvariable=self.thresh_var,
+                                 values=["otsu", "adaptive", "triangle"],
+                                 state="readonly", font=FT["body"])
+        cb_thresh.pack(fill="x", padx=10, pady=(2, 10))
 
         self._sl(p, "lbl_minpore")
         self.min_pore_var = tk.IntVar(value=10)
@@ -718,83 +1247,88 @@ class MembraneAnalyzerApp(tk.Tk):
 
         self._sl(p, "lbl_side")
         self.side_var = tk.StringVar(value="top")
-        ttk.Combobox(p, textvariable=self.side_var,
-                     values=["top","bottom","left","right"],
-                     state="readonly", font=FT["body"]
-                     ).pack(fill="x", padx=10, pady=(2,10))
+        cb_side = ttk.Combobox(p, textvariable=self.side_var,
+                               values=["top", "bottom", "left", "right"],
+                               state="readonly", font=FT["body"])
+        cb_side.pack(fill="x", padx=10, pady=(2, 10))
 
         self._sl(p, "lbl_cluster")
         self.cluster_var = tk.IntVar(value=5)
-        self._slider(p, self.cluster_var, 2, 10, C["blue"])
+        self._slider(p, self.cluster_var, 2, 12, C["blue"])
+
+        # Mark dirty on param change
+        for var in (self.thresh_var, self.min_pore_var, self.side_var,
+                    self.cluster_var, self.scale_var):
+            var.trace_add("write", self._mark_dirty)
 
         _sep(p).pack(fill="x", padx=10, pady=10)
 
         # ── Actions
         self._sh(p, "sec_actions")
 
-        self._run_btn = tk.Button(p, text=self.t("btn_run"),
-                                  command=self._run,
+        # Re-run reminder badge
+        self._remind_lbl = tk.Label(p, text="", font=FT["small"],
+                                    fg=C["amber"], bg=C["bg_panel"],
+                                    wraplength=270, justify="left")
+        self._remind_lbl.pack(anchor="w", padx=10, pady=(0, 4))
+
+        self._run_btn = tk.Button(p, text=self.t("btn_run"), command=self._run,
                                   bg=C["teal"], fg=C["text_inv"],
-                                  font=(F_UI,10,"bold"), relief="flat",
-                                  cursor="hand2",
-                                  activebackground="#3AB09A",
+                                  font=(F_UI, 10, "bold"), relief="flat",
+                                  cursor="hand2", activebackground="#3AB09A",
                                   activeforeground=C["text_inv"])
-        self._run_btn.pack(fill="x", padx=10, pady=(0,6), ipady=9)
+        self._run_btn.pack(fill="x", padx=10, pady=(0, 6), ipady=9)
         self._i18n_reg(self._run_btn, "text", "btn_run")
 
         for lk, cmd, bg, fg in [
-            ("btn_csv",   self._export_csv, C["blue_dim"], C["blue"]),
-            ("btn_pdf",   self._export_pdf, C["blue_dim"], C["blue"]),
-            ("btn_reset", self._reset,      C["red_dim"],  C["red"]),
+            ("btn_csv",  self._export_csv,  C["blue_dim"],  C["blue"]),
+            ("btn_json", self._export_json, C["green_dim"], C["green"]),
+            ("btn_pdf",  self._export_pdf,  C["blue_dim"],  C["blue"]),
+            ("btn_reset",self._reset,       C["red_dim"],   C["red"]),
         ]:
             btn = tk.Button(p, text=self.t(lk), command=cmd,
                             bg=bg, fg=fg, relief="flat", cursor="hand2",
-                            font=FT["small"],
-                            activebackground=C["bg_hover"],
+                            font=FT["small"], activebackground=C["bg_hover"],
                             activeforeground=C["text_hi"], anchor="w")
             btn.pack(fill="x", padx=10, pady=2, ipady=5)
             self._i18n_reg(btn, "text", lk)
 
         self.progress = ttk.Progressbar(p, mode="indeterminate",
                                         style="Teal.Horizontal.TProgressbar")
-        self.progress.pack(fill="x", padx=10, pady=(10,4))
+        self.progress.pack(fill="x", padx=10, pady=(10, 4))
 
-        self._sb_status = tk.Label(p, text=self.t("sb_hint"),
-                                   font=FT["small"], fg=C["text_lo"],
-                                   bg=C["bg_panel"], wraplength=255, justify="left")
-        self._sb_status.pack(anchor="w", padx=10, pady=(2,16))
+        self._sb_status = tk.Label(p, text=self.t("sb_hint"), font=FT["small"],
+                                   fg=C["text_lo"], bg=C["bg_panel"],
+                                   wraplength=270, justify="left")
+        self._sb_status.pack(anchor="w", padx=10, pady=(2, 16))
         self._i18n_reg(self._sb_status, "text", "sb_hint")
 
     def _mode_row(self, parent, val, lang_key, col):
         f = tk.Frame(parent, bg=C["bg_panel"], cursor="hand2")
         f.pack(fill="x", padx=10, pady=2)
         ind = tk.Frame(f, bg=C["bg_input"], width=3)
-        ind.pack(side="left", fill="y", padx=(0,10))
+        ind.pack(side="left", fill="y", padx=(0, 10))
         self._mode_inds[val] = ind
-
-        lbl = tk.Label(f, text=self.t(lang_key),
-                       bg=C["bg_panel"], fg=C["text_md"], font=FT["body"])
+        lbl = tk.Label(f, text=self.t(lang_key), bg=C["bg_panel"],
+                       fg=C["text_md"], font=FT["body"])
         lbl.pack(side="left", anchor="w", pady=5)
         self._mode_labels[val] = lbl
-
-        rb = tk.Radiobutton(f, variable=self.mode_var, value=val,
-                            bg=C["bg_panel"], fg=C["bg_panel"],
-                            selectcolor=C["bg_panel"],
-                            activebackground=C["bg_panel"],
-                            relief="flat", bd=0, indicatoron=True)
+        rb = tk.Radiobutton(f, variable=self.mode_var, value=val, bg=C["bg_panel"],
+                            fg=C["bg_panel"], selectcolor=C["bg_panel"],
+                            activebackground=C["bg_panel"], relief="flat",
+                            bd=0, indicatoron=True)
         rb.pack(side="right")
-
-        # Tıklama için frame'e de bind et
-        def on_click(_=None):
-            self.mode_var.set(val)
-        f.bind("<Button-1>", on_click)
-        lbl.bind("<Button-1>", on_click)
+        f.bind("<Button-1>",   lambda e, v=val: self.mode_var.set(v))
+        lbl.bind("<Button-1>", lambda e, v=val: self.mode_var.set(v))
+        col_map = {v: c for v, _, c in self._modes}
 
         def refresh(*_):
             for v2, i2 in self._mode_inds.items():
-                c2 = dict((v,c) for v,lk,c in self._modes).get(v2, C["bg_input"])
-                i2.configure(bg=c2 if self.mode_var.get()==v2 else C["bg_input"])
+                c2 = col_map.get(v2, C["bg_input"])
+                i2.configure(bg=c2 if self.mode_var.get() == v2 else C["bg_input"])
+
         self.mode_var.trace_add("write", refresh)
+        self.mode_var.trace_add("write", self._mark_dirty)
 
     # ── MAIN AREA ─────────────────────────────────────────────────────────────
     def _build_main(self, parent):
@@ -802,35 +1336,41 @@ class MembraneAnalyzerApp(tk.Tk):
         main.pack(side="left", fill="both", expand=True)
 
         top = tk.Frame(main, bg=C["bg_root"])
-        top.pack(fill="both", expand=True, padx=10, pady=(10,5))
+        top.pack(fill="both", expand=True, padx=10, pady=(10, 5))
 
-        img_card = tk.Frame(top, bg=C["bg_card"],
+        img_wrap = tk.Frame(top, bg=C["bg_card"],
                             highlightbackground=C["border"], highlightthickness=1)
-        img_card.pack(side="left", fill="both", expand=True)
-        self.img_canvas = tk.Canvas(img_card, bg=C["bg_card"], highlightthickness=0)
-        self.img_canvas.pack(fill="both", expand=True, padx=1, pady=1)
+        img_wrap.pack(side="left", fill="both", expand=True)
+
+        # Zoom hint bar
+        self._zoom_hint = tk.Label(img_wrap, text=self.t("zoom_hint"),
+                                   font=FT["mono_s"], fg=C["text_lo"],
+                                   bg=C["bg_card"], anchor="w")
+        self._zoom_hint.pack(fill="x", padx=8, pady=(4, 0))
+
+        self.img_canvas = ZoomCanvas(img_wrap, bg=C["bg_card"], highlightthickness=0)
+        self.img_canvas.pack(fill="both", expand=True, padx=1, pady=(0, 1))
         self._placeholder()
 
         # Metric cards
-        mc_col = tk.Frame(top, bg=C["bg_root"], width=185)
-        mc_col.pack(side="right", fill="y", padx=(8,0))
+        mc_col = tk.Frame(top, bg=C["bg_root"], width=190)
+        mc_col.pack(side="right", fill="y", padx=(8, 0))
         mc_col.pack_propagate(False)
-
         self._mc_meta = {
-            "porosity": (MetricCard(mc_col, self.t("mc_porosity"), "%",   C["teal"]),  "mc_porosity", "%"),
-            "pores":    (MetricCard(mc_col, self.t("mc_pores"),    "adet",C["blue"]),  "mc_pores",    ""),
-            "diam":     (MetricCard(mc_col, self.t("mc_diam"),     "px",  C["amber"]), "mc_diam",     "px"),
-            "fouling":  (MetricCard(mc_col, self.t("mc_fouling"),  "px",  C["red"]),   "mc_fouling",  "px"),
+            "porosity": (MetricCard(mc_col, self.t("mc_porosity"), "%",  C["teal"]),  "mc_porosity", "%"),
+            "pores":    (MetricCard(mc_col, self.t("mc_pores"),    "",   C["blue"]),  "mc_pores",    ""),
+            "diam":     (MetricCard(mc_col, self.t("mc_diam"),     "px", C["amber"]), "mc_diam",     "px"),
+            "fouling":  (MetricCard(mc_col, self.t("mc_fouling"),  "px", C["red"]),   "mc_fouling",  "px"),
         }
         self.mc = {k: v[0] for k, v in self._mc_meta.items()}
-        for mc in self.mc.values(): mc.pack(fill="x", pady=(0,6))
+        for mc in self.mc.values():
+            mc.pack(fill="x", pady=(0, 6))
 
         # Tabs
         _sep(main).pack(fill="x", padx=10)
-        tab_wrap = tk.Frame(main, bg=C["bg_root"], height=295)
-        tab_wrap.pack(fill="x", padx=10, pady=(5,10))
+        tab_wrap = tk.Frame(main, bg=C["bg_root"], height=300)
+        tab_wrap.pack(fill="x", padx=10, pady=(5, 10))
         tab_wrap.pack_propagate(False)
-
         self.nb = ttk.Notebook(tab_wrap, style="Dark.TNotebook")
         self.nb.pack(fill="both", expand=True)
         self.tab_r = tk.Frame(self.nb, bg=C["bg_card"])
@@ -839,28 +1379,28 @@ class MembraneAnalyzerApp(tk.Tk):
         self.nb.add(self.tab_r, text=self.t("tab_results"))
         self.nb.add(self.tab_c, text=self.t("tab_charts"))
         self.nb.add(self.tab_l, text=self.t("tab_log"))
-        self._build_results(); self._build_charts(); self._build_log()
+        self._build_results()
+        self._build_charts()
+        self._build_log()
 
     def _build_results(self):
         self.rt = tk.Text(self.tab_r, bg=C["bg_card"], fg=C["text_md"],
                           font=FT["mono"], relief="flat",
-                          insertbackground=C["teal"],
-                          selectbackground=C["blue_dim"],
+                          insertbackground=C["teal"], selectbackground=C["blue_dim"],
                           wrap="none", padx=16, pady=12,
                           state="disabled", spacing1=2, spacing3=2)
         sb = tk.Scrollbar(self.tab_r, command=self.rt.yview)
         self.rt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.rt.pack(fill="both", expand=True)
-        for tag, col in [("hdr",C["teal"]),("key",C["text_lo"]),
-                         ("ok",C["teal"]),("warn",C["amber"]),
-                         ("err",C["red"]),("info",C["blue"])]:
+        for tag, col in [("hdr", C["teal"]), ("key", C["text_lo"]), ("ok", C["teal"]),
+                         ("warn", C["amber"]), ("err", C["red"]),    ("info", C["blue"])]:
             self.rt.tag_configure(tag, foreground=col,
-                                  font=(F_NUM,9,"bold") if tag=="hdr" else FT["mono"])
+                                  font=(F_NUM, 9, "bold") if tag == "hdr" else FT["mono"])
         self._rt_default()
 
     def _build_charts(self):
-        self.fig = Figure(facecolor=C["bg_card"])
+        self.fig     = Figure(facecolor=C["bg_card"])
         self.plot_cv = FigureCanvasTkAgg(self.fig, master=self.tab_c)
         self.plot_cv.get_tk_widget().pack(fill="both", expand=True)
 
@@ -872,57 +1412,64 @@ class MembraneAnalyzerApp(tk.Tk):
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.log.pack(fill="both", expand=True)
-        for tag, col in [("ok",C["teal"]),("err",C["red"]),("ts",C["text_lo"])]:
+        for tag, col in [("ok", C["teal"]), ("err", C["red"]), ("ts", C["text_lo"])]:
             self.log.tag_configure(tag, foreground=col)
 
     # ── TTK ───────────────────────────────────────────────────────────────────
     def _apply_ttk(self):
-        s = ttk.Style(self); s.theme_use("clam")
+        s = ttk.Style(self)
+        s.theme_use("clam")
         s.configure("Dark.TNotebook", background=C["bg_root"],
-                    borderwidth=0, tabmargins=[0,0,0,0])
+                    borderwidth=0, tabmargins=[0, 0, 0, 0])
         s.configure("Dark.TNotebook.Tab", background=C["bg_panel"],
                     foreground=C["text_lo"], font=FT["small"],
-                    padding=[14,6], borderwidth=0)
+                    padding=[14, 6], borderwidth=0)
         s.map("Dark.TNotebook.Tab",
-              background=[("selected",C["bg_card"]),("active",C["bg_hover"])],
-              foreground=[("selected",C["teal"]),   ("active",C["text_md"])])
-        s.configure("TCombobox", fieldbackground=C["bg_input"],
-                    background=C["bg_input"], foreground=C["text_md"],
-                    arrowcolor=C["text_lo"], selectbackground=C["blue_dim"])
-        s.map("TCombobox", fieldbackground=[("readonly",C["bg_input"])],
-              foreground=[("readonly",C["text_md"])])
+              background=[("selected", C["bg_card"]), ("active", C["bg_hover"])],
+              foreground=[("selected", C["teal"]),    ("active", C["text_md"])])
+        s.configure("TCombobox", fieldbackground=C["bg_input"], background=C["bg_input"],
+                    foreground=C["text_md"], arrowcolor=C["text_lo"],
+                    selectbackground=C["blue_dim"])
+        s.map("TCombobox", fieldbackground=[("readonly", C["bg_input"])],
+              foreground=[("readonly", C["text_md"])])
         s.configure("Teal.Horizontal.TProgressbar",
                     troughcolor=C["bg_input"], background=C["teal"],
                     borderwidth=0, thickness=3)
-        self.option_add("*TCombobox*Listbox.background",      C["bg_input"])
-        self.option_add("*TCombobox*Listbox.foreground",      C["text_md"])
+        self.option_add("*TCombobox*Listbox.background",       C["bg_input"])
+        self.option_add("*TCombobox*Listbox.foreground",       C["text_md"])
         self.option_add("*TCombobox*Listbox.selectBackground", C["blue_dim"])
-        self.option_add("*TCombobox*Listbox.font",            FT["body"])
+        self.option_add("*TCombobox*Listbox.font",             FT["body"])
 
-    # ── SIDEBAR HELPERS ───────────────────────────────────────────────────────
+    # ── HELPERS ───────────────────────────────────────────────────────────────
     def _sh(self, p, key):
-        """Section header — registered for lang switch."""
         f = tk.Frame(p, bg=C["bg_panel"])
-        f.pack(fill="x", padx=10, pady=(14,4))
-        lbl = tk.Label(f, text=self.t(key), font=(F_UI,8,"bold"),
+        f.pack(fill="x", padx=10, pady=(14, 4))
+        lbl = tk.Label(f, text=self.t(key), font=(F_UI, 8, "bold"),
                        fg=C["text_lo"], bg=C["bg_panel"])
         lbl.pack(side="left")
         self._i18n_reg(lbl, "text", key)
 
     def _sl(self, p, key):
-        """Sub-label — registered."""
         lbl = tk.Label(p, text=self.t(key), font=FT["small"],
                        fg=C["text_lo"], bg=C["bg_panel"])
-        lbl.pack(anchor="w", padx=10, pady=(4,0))
+        lbl.pack(anchor="w", padx=10, pady=(4, 0))
         self._i18n_reg(lbl, "text", key)
 
     def _slider(self, p, var, lo, hi, col):
         tk.Scale(p, from_=lo, to=hi, variable=var, orient="horizontal",
-                 bg=C["bg_panel"], fg=C["text_md"],
-                 troughcolor=C["bg_input"], highlightthickness=0,
-                 activebackground=col, font=FT["small"],
+                 bg=C["bg_panel"], fg=C["text_md"], troughcolor=C["bg_input"],
+                 highlightthickness=0, activebackground=col, font=FT["small"],
                  sliderlength=14, showvalue=True, bd=0
-                 ).pack(fill="x", padx=10, pady=(2,10))
+                 ).pack(fill="x", padx=10, pady=(2, 10))
+
+    def _mark_dirty(self, *_):
+        if self.engine.results:
+            self._params_dirty = True
+            self._remind_lbl.configure(text=self.t("remind_rerun"))
+
+    def _clear_dirty(self):
+        self._params_dirty = False
+        self._remind_lbl.configure(text="")
 
     # ── PLACEHOLDER ───────────────────────────────────────────────────────────
     def _placeholder(self):
@@ -931,47 +1478,46 @@ class MembraneAnalyzerApp(tk.Tk):
         h = self.img_canvas.winfo_height() or 400
         self.img_canvas.delete("all")
         self.img_canvas.create_rectangle(0, 0, w, h, fill=C["bg_card"], outline="")
-        for x in range(0, w, 44): self.img_canvas.create_line(x,0,x,h, fill=C["sep"])
-        for y in range(0, h, 44): self.img_canvas.create_line(0,y,w,y, fill=C["sep"])
-        cx, cy = w//2, h//2
-        self.img_canvas.create_text(cx, cy-16, text="\u2610",
-                                    font=(F_UI,34), fill=C["border"])
-        self.img_canvas.create_text(cx, cy+22, font=FT["small"],
+        for x in range(0, w, 44):
+            self.img_canvas.create_line(x, 0, x, h, fill=C["sep"])
+        for y in range(0, h, 44):
+            self.img_canvas.create_line(0, y, w, y, fill=C["sep"])
+        cx, cy = w // 2, h // 2
+        self.img_canvas.create_text(cx, cy - 20, text="⊡",
+                                    font=(F_UI, 34), fill=C["border"])
+        self.img_canvas.create_text(cx, cy + 20, font=FT["small"],
                                     fill=C["text_lo"], text=self.t("ph_line1"))
-        self.img_canvas.create_text(cx, cy+40, font=FT["small"],
-                                    fill=C["sep"], text=self.t("ph_line2"))
+        self.img_canvas.create_text(cx, cy + 38, font=FT["small"],
+                                    fill=C["sep"],     text=self.t("ph_line2"))
+        self.img_canvas.create_text(cx, cy + 56, font=FT["mono_s"],
+                                    fill=C["border"],  text=self.t("ph_line3"))
+        self.img_canvas._pil_orig = None   # reset zoom state
 
-    def _load_preview(self, path):
+    def _load_file(self, path: str):
+        """Load primary image — called from browse, drop, or recent menu."""
         try:
-            pil = Image.open(path)
-            self.img_canvas.update_idletasks()
-            cw = self.img_canvas.winfo_width()  or 800
-            ch = self.img_canvas.winfo_height() or 400
-            pil.thumbnail((cw-4,ch-4), Image.LANCZOS)
-            self._tk_img = ImageTk.PhotoImage(pil)
-            self.img_canvas.delete("all")
-            self.img_canvas.create_rectangle(0,0,cw,ch, fill=C["bg_card"], outline="")
-            self.img_canvas.create_image(cw//2, ch//2,
-                                         image=self._tk_img, anchor="center")
-            info = f"  {Path(path).name}  \u00b7  {pil.size[0]} x {pil.size[1]} px"
-            self.img_canvas.create_rectangle(0,0,cw,22, fill="#00000077", outline="")
-            self.img_canvas.create_text(10, 11, anchor="w",
-                                        text=info, font=FT["mono_s"], fill=C["text_lo"])
+            self.engine.load_image(path)
         except Exception as e:
-            self._log_add(self.t("log_prev_err") + str(e), "err")
+            messagebox.showerror(self.t("dlg_err"), str(e))
+            return
+        self.img_path.set(path)
+        pil = Image.fromarray(cv2.cvtColor(self.engine.original, cv2.COLOR_BGR2RGB))
+        self.img_canvas.show_pil(pil)
+        # Info bar overlay
+        self.img_canvas.create_rectangle(0, 0, self.img_canvas.winfo_width(), 22,
+                                         fill="#00000077", outline="")
+        self.img_canvas.create_text(10, 11, anchor="w",
+                                    text=self.engine.meta.label(),
+                                    font=FT["mono_s"], fill=C["text_lo"])
+        self._log_add(self.t("log_loaded") + Path(path).name, "ok")
+        self._recent = add_recent(path, self._recent)
+        save_recent(self._recent)
+        self._rebuild_recent_menu()
 
-    def _show_cv2(self, bgr):
+    def _show_cv2(self, bgr: np.ndarray):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
-        self.img_canvas.update_idletasks()
-        cw = self.img_canvas.winfo_width()  or 800
-        ch = self.img_canvas.winfo_height() or 400
-        pil.thumbnail((cw-4,ch-4), Image.LANCZOS)
-        self._tk_img = ImageTk.PhotoImage(pil)
-        self.img_canvas.delete("all")
-        self.img_canvas.create_rectangle(0,0,cw,ch, fill=C["bg_card"], outline="")
-        self.img_canvas.create_image(cw//2, ch//2,
-                                     image=self._tk_img, anchor="center")
+        self.img_canvas.show_pil(pil)
 
     # ── BROWSE ────────────────────────────────────────────────────────────────
     @property
@@ -984,9 +1530,7 @@ class MembraneAnalyzerApp(tk.Tk):
         p = filedialog.askopenfilename(title=self.t("browse_primary"),
                                        filetypes=self._ftypes)
         if p:
-            self.img_path.set(p)
-            self._load_preview(p)
-            self._log_add(self.t("log_loaded") + Path(p).name, "ok")
+            self._load_file(p)
 
     def _browse2(self):
         p = filedialog.askopenfilename(title=self.t("browse_compare"),
@@ -1000,9 +1544,19 @@ class MembraneAnalyzerApp(tk.Tk):
         path = self.img_path.get().strip()
         mode = self.mode_var.get()
         if not path and mode != "Comparison":
-            messagebox.showwarning(self.t("dlg_no_img"), self.t("dlg_no_img_msg")); return
+            messagebox.showwarning(self.t("dlg_no_img"), self.t("dlg_no_img_msg"))
+            return
         if mode == "Comparison" and (not self.img_path.get() or not self.img_path2.get()):
-            messagebox.showwarning(self.t("dlg_two_img"), self.t("dlg_two_img_msg")); return
+            messagebox.showwarning(self.t("dlg_two_img"), self.t("dlg_two_img_msg"))
+            return
+        # Sync scale
+        try:
+            scale = float(self.scale_var.get())
+            self.engine.scale_um_per_px = scale if scale > 0 else 1.0
+        except Exception:
+            self.engine.scale_um_per_px = 1.0
+
+        self._clear_dirty()
         self.progress.start(8)
         self._set_status(self.t("status_analyzing"), C["amber"])
         threading.Thread(target=self._thread, daemon=True).start()
@@ -1011,7 +1565,8 @@ class MembraneAnalyzerApp(tk.Tk):
         try:
             mode = self.mode_var.get()
             path = self.img_path.get().strip()
-            if mode != "Comparison": self.engine.load_image(path)
+            if mode != "Comparison":
+                self.engine.load_image(path)
             if mode == "Porosity":
                 r = self.engine.analyze_porosity(self.thresh_var.get(), self.min_pore_var.get())
                 self.after(0, lambda: self._disp_porosity(r))
@@ -1026,12 +1581,15 @@ class MembraneAnalyzerApp(tk.Tk):
                                                self.img_path2.get(),
                                                self.thresh_var.get())
                 self.after(0, lambda: self._disp_comparison(r))
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            self._log_add(f"[{ts}] {mode}" + self.t("log_done"), "ok")
+            ts  = datetime.datetime.now().strftime("%H:%M:%S")
+            msg = f"[{ts}] {mode}" + self.t("log_done")
+            self.after(0, lambda: self._log_add(msg, "ok"))
             self.after(0, lambda: self._set_status(self.t("status_done"), C["teal"]))
         except Exception as e:
-            self._log_add(self.t("log_err") + str(e), "err")
-            self.after(0, lambda: messagebox.showerror(self.t("dlg_err"), str(e)))
+            err = str(e)
+            log.error("Analysis error: %s", err)
+            self.after(0, lambda: self._log_add(self.t("log_err") + err, "err"))
+            self.after(0, lambda: messagebox.showerror(self.t("dlg_err"), err))
             self.after(0, lambda: self._set_status(self.t("status_error"), C["red"]))
         finally:
             self.after(0, self.progress.stop)
@@ -1039,92 +1597,107 @@ class MembraneAnalyzerApp(tk.Tk):
     # ── RESULTS TEXT ──────────────────────────────────────────────────────────
     def _rt_default(self):
         self.rt.configure(state="normal")
-        self.rt.delete("1.0","end")
+        self.rt.delete("1.0", "end")
         self.rt.insert("end", self.t("rt_default1"), "key")
         self.rt.insert("end", self.t("rt_default2"), "key")
         self.rt.configure(state="disabled")
 
     def _clr_rt(self):
-        self.rt.configure(state="normal"); self.rt.delete("1.0","end")
+        self.rt.configure(state="normal")
+        self.rt.delete("1.0", "end")
 
-    def _rt_head(self, key):
+    def _rt_head(self, key: str):
         self.rt.insert("end", f"\n  {self.t(key)}\n  {'─'*46}\n", "hdr")
 
-    def _rt_row(self, key, val, tag="ok"):
-        self.rt.insert("end", f"  {self.t(key):<34}", "key")
+    def _rt_row(self, key: str, val, tag: str = "ok"):
+        self.rt.insert("end", f"  {self.t(key):<36}", "key")
         self.rt.insert("end", f"{val}\n", tag)
 
     # ── DISPLAY ───────────────────────────────────────────────────────────────
-    def _disp_porosity(self, r):
+    def _disp_porosity(self, r: PorosityResult):
         self._clr_rt()
         self._rt_head("hdr_por")
         self._rt_row("k_method",    r["method"].upper(), "info")
         self._rt_row("k_porosity",  f"{r['porosity_pct']:.3f} %",
                      "warn" if r["porosity_pct"] < 5 else "ok")
-        self._rt_row("k_pore_count",r["pore_count"])
+        self._rt_row("k_pore_count", r["pore_count"])
         self._rt_head("hdr_psd")
-        self._rt_row("k_mean_diam", r["mean_diam_px"])
-        self._rt_row("k_std_diam",  r["std_diam_px"])
-        self._rt_row("k_min_diam",  r["min_diam_px"])
-        self._rt_row("k_max_diam",  r["max_diam_px"])
+        self._rt_row("k_mean_diam",    r["mean_diam_px"])
+        self._rt_row("k_mean_diam_um", f"{r['mean_diam_um']:.3f}" if self.engine.scale_um_per_px != 1.0 else "N/A (not calibrated)")
+        self._rt_row("k_std_diam",     r["std_diam_px"])
+        self._rt_row("k_min_diam",     r["min_diam_px"])
+        self._rt_row("k_max_diam",     r["max_diam_px"])
+        self._rt_head("hdr_psd_pct")
+        self._rt_row("k_d10",       r["d10_px"])
+        self._rt_row("k_d50",       r["d50_px"])
+        self._rt_row("k_d90",       r["d90_px"])
         self._rt_row("k_eccentric", r["mean_eccentric"])
         self.rt.configure(state="disabled")
+
         self.mc["porosity"].set(f"{r['porosity_pct']:.2f}")
         self.mc["pores"].set(r["pore_count"])
         self.mc["diam"].set(f"{r['mean_diam_px']:.1f}")
         self.mc["fouling"].set("--")
+
         ov = self.engine.original.copy()
-        ov[r["mask"]>0] = [0,175,140]
-        self._show_cv2(cv2.addWeighted(self.engine.original,0.55,ov,0.45,0))
+        ov[r["mask"] > 0] = [0, 175, 140]
+        self._show_cv2(cv2.addWeighted(self.engine.original, 0.55, ov, 0.45, 0))
         self._plt_porosity(r)
 
-    def _disp_fouling(self, r):
+    def _disp_fouling(self, r: FoulingResult):
         self._clr_rt()
         self._rt_head("hdr_foul")
         self._rt_row("k_side",      r["layer_side"].upper(), "info")
         self._rt_row("k_interface", r["interface_row_px"])
         self._rt_row("k_f_px",      r["fouling_thickness_px"])
         self._rt_row("k_f_pct",     f"{r['fouling_thickness_pct']:.2f} %",
-                     "warn" if r["fouling_thickness_pct"]>30 else "ok")
+                     "warn" if r["fouling_thickness_pct"] > 30 else "ok")
         self._rt_head("hdr_int")
-        self._rt_row("k_l_int",   r["layer_mean_intensity"])
-        self._rt_row("k_m_int",   r["membrane_mean_intensity"])
-        self._rt_row("k_contrast",r["contrast_ratio"])
+        self._rt_row("k_l_int",    r["layer_mean_intensity"])
+        self._rt_row("k_m_int",    r["membrane_mean_intensity"])
+        self._rt_row("k_contrast", r["contrast_ratio"])
+        self._rt_row("k_snr",      f"{r['snr_db']:.2f} dB",
+                     "ok" if r["snr_db"] > 10 else "warn")
         self.rt.configure(state="disabled")
+
         self.mc["fouling"].set(r["fouling_thickness_px"])
-        for k in ["porosity","pores","diam"]: self.mc[k].set("--")
+        for k in ["porosity", "pores", "diam"]:
+            self.mc[k].set("--")
         self._plt_fouling(r)
 
-    def _disp_sites(self, r):
+    def _disp_sites(self, r: ActiveSiteResult):
         self._clr_rt()
         self._rt_head("hdr_sites")
-        self._rt_row("k_k",         r["cluster_count"], "info")
-        self._rt_row("k_bright_cnt",r["bright_site_count"])
-        self._rt_row("k_dark_cnt",  r["dark_site_count"])
-        self._rt_row("k_total_cnt", r["total_site_count"])
+        self._rt_row("k_k",          r["cluster_count"], "info")
+        self._rt_row("k_bright_cnt", r["bright_site_count"])
+        self._rt_row("k_dark_cnt",   r["dark_site_count"])
+        self._rt_row("k_total_cnt",  r["total_site_count"])
         self._rt_head("hdr_cov")
-        self._rt_row("k_bright_cov",f"{r['bright_coverage_pct']:.3f} %")
-        self._rt_row("k_dark_cov",  f"{r['dark_coverage_pct']:.3f} %")
-        total = r["bright_coverage_pct"]+r["dark_coverage_pct"]
-        self._rt_row("k_total_cov", f"{total:.3f} %", "warn" if total<1.0 else "ok")
+        self._rt_row("k_bright_cov", f"{r['bright_coverage_pct']:.3f} %")
+        self._rt_row("k_dark_cov",   f"{r['dark_coverage_pct']:.3f} %")
+        self._rt_row("k_total_cov",  f"{r['total_coverage_pct']:.3f} %",
+                     "warn" if r["total_coverage_pct"] < 1.0 else "ok")
         self.rt.configure(state="disabled")
+
         self.mc["pores"].set(r["total_site_count"])
-        for k in ["porosity","diam","fouling"]: self.mc[k].set("--")
+        for k in ["porosity", "diam", "fouling"]:
+            self.mc[k].set("--")
         self._plt_sites(r)
 
-    def _disp_comparison(self, r):
+    def _disp_comparison(self, r: ComparisonResult):
         self._clr_rt()
         self._rt_head("hdr_comp")
         self._rt_row("k_img1_por", f"{r['img1_porosity']:.3f}")
         self._rt_row("k_img2_por", f"{r['img2_porosity']:.3f}")
         d = r["delta_porosity"]
-        self._rt_row("k_delta", f"{d:+.3f} %", "warn" if abs(d)>5 else "ok")
+        self._rt_row("k_delta",    f"{d:+.3f} %", "warn" if abs(d) > 5 else "ok")
         self._rt_head("hdr_cnt")
         self._rt_row("k_img1_cnt",  r["img1_pore_count"])
         self._rt_row("k_img2_cnt",  r["img2_pore_count"])
         self._rt_row("k_img1_diam", r["img1_mean_diam"])
         self._rt_row("k_img2_diam", r["img2_mean_diam"])
         self.rt.configure(state="disabled")
+
         self.mc["porosity"].set(f"{d:+.2f}")
         self.mc["pores"].set(f"{r['img1_pore_count']} / {r['img2_pore_count']}")
         self.mc["diam"].set(f"{r['img1_mean_diam']:.1f}")
@@ -1135,134 +1708,240 @@ class MembraneAnalyzerApp(tk.Tk):
     def _ax_style(self, ax):
         ax.set_facecolor(C["bg_card"])
         ax.tick_params(colors=C["text_lo"], labelsize=7)
-        for sp in ax.spines.values(): sp.set_edgecolor(C["border"])
+        for sp in ax.spines.values():
+            sp.set_edgecolor(C["border"])
 
     def _clr_fig(self):
-        self.fig.clf(); self.fig.patch.set_facecolor(C["bg_card"])
+        self.fig.clf()
+        self.fig.patch.set_facecolor(C["bg_card"])
 
-    def _plt_porosity(self, r):
+    def _plt_porosity(self, r: PorosityResult):
         self._clr_fig()
-        ax1 = self.fig.add_subplot(1,2,1); ax2 = self.fig.add_subplot(1,2,2)
+        ax1 = self.fig.add_subplot(1, 3, 1)
+        ax2 = self.fig.add_subplot(1, 3, 2)
+        ax3 = self.fig.add_subplot(1, 3, 3)
+
         ax1.imshow(r["mask"], cmap="Greens")
         ax1.set_title(self.t("ct_mask"), color=C["teal"], fontsize=9, pad=5)
         ax1.axis("off")
+
         if len(r["diameters"]) > 0:
             ax2.hist(r["diameters"], bins=30, color=C["teal"],
-                     alpha=0.7, edgecolor=C["teal_dim"], linewidth=0.5)
+                     alpha=0.8, edgecolor=C["teal_dim"], linewidth=0.5)
+            for p_val, p_name, p_col in [
+                (r["d10_px"], "D10", C["blue"]),
+                (r["d50_px"], "D50", C["amber"]),
+                (r["d90_px"], "D90", C["red"]),
+            ]:
+                ax2.axvline(p_val, color=p_col, lw=1.2, ls="--", label=f"{p_name}={p_val:.1f}")
             ax2.set_xlabel(self.t("ax_diam"),  color=C["text_lo"], fontsize=8)
             ax2.set_ylabel(self.t("ax_count"), color=C["text_lo"], fontsize=8)
-            ax2.set_title(self.t("ct_psd"),    color=C["teal"], fontsize=9, pad=5)
-        self._ax_style(ax1); self._ax_style(ax2)
-        self.fig.tight_layout(pad=1.5); self.plot_cv.draw()
+            ax2.set_title(self.t("ct_psd"),    color=C["teal"],    fontsize=9, pad=5)
+            ax2.legend(fontsize=6, facecolor=C["bg_card"],
+                       labelcolor=C["text_md"], framealpha=0.8)
+
+        # Eccentricity distribution
+        if r["props"]:
+            eccs = [p.eccentricity for p in r["props"]]
+            ax3.hist(eccs, bins=20, color=C["blue"], alpha=0.8,
+                     edgecolor=C["blue_dim"], linewidth=0.5)
+            ax3.set_xlabel("Eccentricity", color=C["text_lo"], fontsize=8)
+            ax3.set_ylabel(self.t("ax_count"), color=C["text_lo"], fontsize=8)
+            ax3.set_title("Eccentricity Distribution", color=C["blue"], fontsize=9, pad=5)
+
+        for ax in (ax1, ax2, ax3):
+            self._ax_style(ax)
+        self.fig.tight_layout(pad=1.5)
+        self.plot_cv.draw()
         self.nb.select(self.tab_c)
 
-    def _plt_fouling(self, r):
+    def _plt_fouling(self, r: FoulingResult):
         self._clr_fig()
-        ax1 = self.fig.add_subplot(1,2,1); ax2 = self.fig.add_subplot(1,2,2)
+        ax1 = self.fig.add_subplot(1, 2, 1)
+        ax2 = self.fig.add_subplot(1, 2, 2)
+
         ax1.imshow(r["edge_map"], cmap="YlOrBr")
         ax1.axhline(r["interface_row_px"], color=C["teal"], lw=1.5, ls="--")
         ax1.set_title(self.t("ct_edge"), color=C["amber"], fontsize=9, pad=5)
         ax1.axis("off")
+
         prof = r["profile"]
         ax2.plot(prof, range(len(prof)), color=C["teal"], lw=1.5)
         ax2.axhline(r["interface_row_px"], color=C["amber"], lw=1.5,
                     ls="--", label=self.t("ax_interface"))
+        ax2.fill_betweenx(range(r["interface_row_px"]),
+                          np.min(prof), prof[:r["interface_row_px"]],
+                          color=C["amber"], alpha=0.1)
         ax2.invert_yaxis()
         ax2.set_xlabel(self.t("ax_intensity"), color=C["text_lo"], fontsize=8)
         ax2.set_ylabel(self.t("ax_row"),       color=C["text_lo"], fontsize=8)
-        ax2.set_title(self.t("ct_profile"),    color=C["amber"], fontsize=9, pad=5)
+        ax2.set_title(f"{self.t('ct_profile')}  —  SNR {r['snr_db']:.1f} dB",
+                      color=C["amber"], fontsize=9, pad=5)
         ax2.legend(fontsize=7, facecolor=C["bg_card"],
                    labelcolor=C["text_md"], framealpha=0.8)
-        self._ax_style(ax1); self._ax_style(ax2)
-        self.fig.tight_layout(pad=1.5); self.plot_cv.draw()
+
+        for ax in (ax1, ax2):
+            self._ax_style(ax)
+        self.fig.tight_layout(pad=1.5)
+        self.plot_cv.draw()
         self.nb.select(self.tab_c)
 
-    def _plt_sites(self, r):
+    def _plt_sites(self, r: ActiveSiteResult):
         self._clr_fig()
-        ax1,ax2,ax3 = (self.fig.add_subplot(1,3,i) for i in (1,2,3))
+        ax1 = self.fig.add_subplot(2, 2, 1)
+        ax2 = self.fig.add_subplot(2, 2, 2)
+        ax3 = self.fig.add_subplot(2, 2, 3)
+        ax4 = self.fig.add_subplot(2, 2, 4)
+
         ax1.imshow(r["g_norm"], cmap="gray")
-        ax1.set_title(self.t("ct_norm"),  color=C["text_md"], fontsize=9, pad=5); ax1.axis("off")
+        ax1.set_title(self.t("ct_norm"),   color=C["text_md"], fontsize=9, pad=5)
+        ax1.axis("off")
+
         ax2.imshow(r["bright_mask"], cmap="YlOrBr")
         ax2.set_title(f"{self.t('ct_bright')} ({r['bright_site_count']})",
-                      color=C["amber"], fontsize=9, pad=5); ax2.axis("off")
+                      color=C["amber"], fontsize=9, pad=5)
+        ax2.axis("off")
+
         ax3.imshow(r["dark_mask"], cmap="GnBu")
         ax3.set_title(f"{self.t('ct_dark')} ({r['dark_site_count']})",
-                      color=C["blue"], fontsize=9, pad=5);  ax3.axis("off")
-        for ax in (ax1,ax2,ax3): self._ax_style(ax)
-        self.fig.tight_layout(pad=1.5); self.plot_cv.draw()
+                      color=C["blue"], fontsize=9, pad=5)
+        ax3.axis("off")
+
+        ax4.imshow(r["kmeans_labels"], cmap="tab10", interpolation="nearest")
+        ax4.set_title(f"{self.t('ct_kmeans')} (k={r['cluster_count']})",
+                      color=C["teal"], fontsize=9, pad=5)
+        ax4.axis("off")
+
+        for ax in (ax1, ax2, ax3, ax4):
+            self._ax_style(ax)
+        self.fig.tight_layout(pad=1.5)
+        self.plot_cv.draw()
         self.nb.select(self.tab_c)
 
-    def _plt_comparison(self, r):
+    def _plt_comparison(self, r: ComparisonResult):
         self._clr_fig()
-        ax1 = self.fig.add_subplot(1,2,1); ax2 = self.fig.add_subplot(1,2,2)
+        ax1 = self.fig.add_subplot(1, 2, 1)
+        ax2 = self.fig.add_subplot(1, 2, 2)
+
         lbls = [self.t("lbl_img1_bar"), self.t("lbl_img2_bar")]
-        ax1.bar(lbls, [r["img1_porosity"],  r["img2_porosity"]],
-                color=[C["teal"],C["blue"]], width=0.45, edgecolor="none")
-        ax1.set_ylabel(self.t("ax_porosity"),  color=C["text_lo"], fontsize=8)
-        ax1.set_title(self.t("ct_por_cmp"),    color=C["teal"], fontsize=9, pad=5)
-        ax2.bar(lbls, [r["img1_pore_count"],r["img2_pore_count"]],
-                color=[C["teal"],C["amber"]], width=0.45, edgecolor="none")
+        bars1 = ax1.bar(lbls, [r["img1_porosity"], r["img2_porosity"]],
+                        color=[C["teal"], C["blue"]], width=0.45, edgecolor="none")
+        for bar, val in zip(bars1, [r["img1_porosity"], r["img2_porosity"]]):
+            ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                     f"{val:.2f}%", ha="center", va="bottom",
+                     fontsize=8, color=C["text_md"])
+        ax1.set_ylabel(self.t("ax_porosity"), color=C["text_lo"], fontsize=8)
+        ax1.set_title(self.t("ct_por_cmp"),   color=C["teal"], fontsize=9, pad=5)
+
+        bars2 = ax2.bar(lbls, [r["img1_pore_count"], r["img2_pore_count"]],
+                        color=[C["teal"], C["amber"]], width=0.45, edgecolor="none")
+        for bar, val in zip(bars2, [r["img1_pore_count"], r["img2_pore_count"]]):
+            ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                     str(val), ha="center", va="bottom",
+                     fontsize=8, color=C["text_md"])
         ax2.set_ylabel(self.t("ax_pore_count"), color=C["text_lo"], fontsize=8)
         ax2.set_title(self.t("ct_cnt_cmp"),     color=C["amber"], fontsize=9, pad=5)
-        self._ax_style(ax1); self._ax_style(ax2)
-        self.fig.tight_layout(pad=1.5); self.plot_cv.draw()
+
+        for ax in (ax1, ax2):
+            self._ax_style(ax)
+        self.fig.tight_layout(pad=1.5)
+        self.plot_cv.draw()
         self.nb.select(self.tab_c)
 
     # ── EXPORT ────────────────────────────────────────────────────────────────
     def _export_csv(self):
         if not self.engine.results:
-            messagebox.showinfo(self.t("dlg_no_data"), self.t("dlg_no_data_msg")); return
+            messagebox.showinfo(self.t("dlg_no_data"), self.t("dlg_no_data_msg"))
+            return
         path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV","*.csv")])
-        if not path: return
-        import csv
-        with open(path,"w",newline="",encoding="utf-8") as f:
+                                            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow([self.t("csv_param"), self.t("csv_value"), self.t("csv_module")])
+            w.writerow([self.t("csv_param"), self.t("csv_value"), self.t("csv_module"),
+                        "image_file", "exported_at", "app_version"])
+            now = datetime.datetime.now().isoformat()
             for mod, data in self.engine.results.items():
-                for k,v in data.items():
-                    if isinstance(v,(int,float,str,bool)): w.writerow([k,v,mod])
+                for k, v in data.items():
+                    if isinstance(v, (int, float, str, bool)):
+                        w.writerow([k, v, mod, self.engine.img_path, now, APP_VERSION])
         self._log_add(self.t("log_csv") + path, "ok")
         messagebox.showinfo(self.t("dlg_exported"), self.t("dlg_csv_done") + path)
 
+    def _export_json(self):
+        if not self.engine.results:
+            messagebox.showinfo(self.t("dlg_no_data"), self.t("dlg_no_data_msg"))
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".json",
+                                            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        self.engine.export_json(path)
+        self._log_add(self.t("log_json") + path, "ok")
+        messagebox.showinfo(self.t("dlg_exported"), self.t("dlg_json_done") + path)
+
     def _export_pdf(self):
         if not self.engine.results:
-            messagebox.showinfo(self.t("dlg_no_data"), self.t("dlg_no_data_msg")); return
+            messagebox.showinfo(self.t("dlg_no_data"), self.t("dlg_no_data_msg"))
+            return
         try:
             from reportlab.lib.pagesizes import A4
-            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+            from reportlab.platypus import (SimpleDocTemplate, Paragraph,
+                                            Spacer, Table, TableStyle, Image as RLImage)
             from reportlab.lib.styles import getSampleStyleSheet
             from reportlab.lib import colors
         except ImportError:
-            messagebox.showerror(self.t("dlg_pkg"), self.t("dlg_pkg_msg")); return
+            messagebox.showerror(self.t("dlg_pkg"), self.t("dlg_pkg_msg"))
+            return
         path = filedialog.asksaveasfilename(defaultextension=".pdf",
-                                            filetypes=[("PDF","*.pdf")])
-        if not path: return
-        doc = SimpleDocTemplate(path, pagesize=A4)
-        styles = getSampleStyleSheet(); story = []
-        now = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+                                            filetypes=[("PDF", "*.pdf")])
+        if not path:
+            return
+
+        doc    = SimpleDocTemplate(path, pagesize=A4)
+        styles = getSampleStyleSheet()
+        story  = []
+        now    = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+
         story.append(Paragraph(self.t("pdf_title"), styles["Title"]))
-        story.append(Paragraph(f"Generated: {now}", styles["Normal"]))
-        story.append(Spacer(1,12))
+        story.append(Paragraph(f"Generated: {now}  |  Image: {Path(self.engine.img_path).name}", styles["Normal"]))
+        story.append(Spacer(1, 14))
+
+        # Embed matplotlib figure
+        try:
+            buf = io.BytesIO()
+            self.fig.savefig(buf, format="png", dpi=120, facecolor=C["bg_card"])
+            buf.seek(0)
+            rl_img = RLImage(buf, width=460, height=200)
+            story.append(rl_img)
+            story.append(Spacer(1, 12))
+        except Exception:
+            pass
+
         for mod, data in self.engine.results.items():
             story.append(Paragraph(self.t("pdf_module") + mod.upper(), styles["Heading2"]))
             rows = [[self.t("pdf_param"), self.t("pdf_value")]]
-            for k,v in data.items():
-                if isinstance(v,(int,float,str,bool)): rows.append([str(k),str(v)])
-            tbl = Table(rows, colWidths=[260,200])
+            for k, v in data.items():
+                if isinstance(v, (int, float, str, bool)):
+                    rows.append([str(k), str(v)])
+            tbl = Table(rows, colWidths=[260, 200])
             tbl.setStyle(TableStyle([
-                ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#20242C")),
-                ("TEXTCOLOR", (0,0),(-1,0),colors.HexColor("#4EC9B0")),
-                ("FONTNAME",  (0,0),(-1,0),"Courier-Bold"),
-                ("ROWBACKGROUNDS",(0,1),(-1,-1),
-                 [colors.HexColor("#1A1D23"),colors.HexColor("#20242C")]),
-                ("TEXTCOLOR", (0,1),(-1,-1),colors.HexColor("#B0B8C8")),
-                ("FONTNAME",  (0,1),(-1,-1),"Courier"),
-                ("FONTSIZE",  (0,0),(-1,-1),9),
-                ("GRID",      (0,0),(-1,-1),0.3,colors.HexColor("#353B48")),
-                ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+                ("BACKGROUND", (0, 0), (-1, 0),  colors.HexColor("#20242C")),
+                ("TEXTCOLOR",  (0, 0), (-1, 0),  colors.HexColor("#4EC9B0")),
+                ("FONTNAME",   (0, 0), (-1, 0),  "Courier-Bold"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                 [colors.HexColor("#1A1D23"), colors.HexColor("#20242C")]),
+                ("TEXTCOLOR",  (0, 1), (-1, -1), colors.HexColor("#B0B8C8")),
+                ("FONTNAME",   (0, 1), (-1, -1), "Courier"),
+                ("FONTSIZE",   (0, 0), (-1, -1), 9),
+                ("GRID",       (0, 0), (-1, -1), 0.3, colors.HexColor("#353B48")),
+                ("TOPPADDING",    (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ]))
-            story.append(tbl); story.append(Spacer(1,14))
+            story.append(tbl)
+            story.append(Spacer(1, 14))
+
         doc.build(story)
         self._log_add(self.t("log_pdf") + path, "ok")
         messagebox.showinfo(self.t("dlg_exported"), self.t("dlg_pdf_done") + path)
@@ -1270,22 +1949,28 @@ class MembraneAnalyzerApp(tk.Tk):
     # ── UTILS ─────────────────────────────────────────────────────────────────
     def _reset(self):
         self.engine = AnalysisEngine()
-        self.img_path.set(""); self.img_path2.set("")
-        self._placeholder(); self._rt_default()
-        self._clr_fig(); self.plot_cv.draw()
-        for mc in self.mc.values(): mc.set("--")
+        self.img_path.set("")
+        self.img_path2.set("")
+        self._placeholder()
+        self._rt_default()
+        self._clr_fig()
+        self.plot_cv.draw()
+        for mc in self.mc.values():
+            mc.set("--")
+        self._clear_dirty()
         self._set_status(self.t("status_reset"), C["text_lo"])
         self._log_add(self.t("log_reset"), "ts")
 
-    def _set_status(self, msg, col=None):
+    def _set_status(self, msg: str, col: str = None):
         col = col or C["text_lo"]
         self._dot.configure(fg=col)
         self._status_lbl.configure(text=f" {msg}")
         self._sb_status.configure(text=msg)
 
-    def _log_add(self, msg, tag="ts"):
+    def _log_add(self, msg: str, tag: str = "ts"):
+        """Must always be called from main thread."""
         self.log.configure(state="normal")
-        self.log.insert("end", msg+"\n", tag)
+        self.log.insert("end", msg + "\n", tag)
         self.log.see("end")
         self.log.configure(state="disabled")
 
