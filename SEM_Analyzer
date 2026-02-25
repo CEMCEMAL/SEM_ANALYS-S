@@ -125,8 +125,14 @@ class PorosityResult(TypedDict):
     d50_px: float
     d90_px: float
     mean_eccentric: float
-    scale_um_per_px: float
+    mean_diam_nm: float
     mean_diam_um: float
+    d10_nm: float
+    d50_nm: float
+    d90_nm: float
+    min_diam_nm: float
+    max_diam_nm: float
+    nm_per_px: float
     mask: np.ndarray
     props: list
     areas: np.ndarray
@@ -193,6 +199,68 @@ class ImageMeta:
                 f"{self.channels}ch  ·  {self.bit_depth}bit  ·  {sz}")
 
 
+@dataclass
+class ScaleCalibration:
+    """
+    Smart scale calibration.
+
+    The user enters ONE value — the physical width the entire image represents
+    — plus the unit (nm, µm, mm).  The system derives nm_per_px automatically
+    from the image width in pixels.
+
+    Example:
+        image_width_px = 1024
+        scale_value    = 500   (user typed "500")
+        scale_unit     = "nm"
+        → nm_per_px    = 500 / 1024  ≈ 0.488 nm/px
+        → um_per_px    = 0.488 / 1000
+    """
+    scale_value: float = 0.0      # physical span the image covers (in chosen unit)
+    scale_unit:  str   = "nm"     # "nm" | "µm" | "mm"
+    image_width_px: int = 1       # set automatically when image is loaded
+
+    # ── derived ──────────────────────────────────────────────────────────────
+    @property
+    def is_calibrated(self) -> bool:
+        return self.scale_value > 0 and self.image_width_px > 0
+
+    @property
+    def nm_per_px(self) -> float:
+        """Nanometres per pixel — the universal internal unit."""
+        if not self.is_calibrated:
+            return 0.0
+        factor = {"nm": 1.0, "µm": 1_000.0, "mm": 1_000_000.0}.get(self.scale_unit, 1.0)
+        return (self.scale_value * factor) / self.image_width_px
+
+    @property
+    def um_per_px(self) -> float:
+        return self.nm_per_px / 1_000.0
+
+    def px_to_nm(self, px: float) -> float:
+        return px * self.nm_per_px
+
+    def px_to_um(self, px: float) -> float:
+        return px * self.um_per_px
+
+    def format_length(self, px: float, decimals: int = 3) -> str:
+        """Return the best human-readable string for a pixel length."""
+        if not self.is_calibrated:
+            return f"{px:.2f} px"
+        nm = self.px_to_nm(px)
+        if nm >= 1_000_000:
+            return f"{nm/1_000_000:.{decimals}f} mm"
+        if nm >= 1_000:
+            return f"{nm/1_000:.{decimals}f} µm"
+        return f"{nm:.{decimals}f} nm"
+
+    def summary(self) -> str:
+        if not self.is_calibrated:
+            return "Kalibrasyon yok — sonuçlar px cinsinden"
+        return (f"{self.scale_value} {self.scale_unit} / görüntü  "
+                f"·  {self.nm_per_px:.4f} nm/px  "
+                f"·  {self.um_per_px:.6f} µm/px")
+
+
 # ─── ANALYSIS MODULES ─────────────────────────────────────────────────────────
 
 class BaseAnalyzer:
@@ -225,6 +293,14 @@ class BaseAnalyzer:
         if h < 32 or w < 32:
             raise ValueError(f"Image too small ({w}×{h} px). Minimum: 32×32.")
 
+        # ── Auto-crop SEM/TEM info bar ─────────────────────────────────────
+        bar_row = detect_info_bar_row(img)
+        if bar_row > 0 and bar_row < h:
+            img  = img[:bar_row, :]
+            h, w = img.shape[:2]
+            log.info("Info bar cropped → analysis region: %dx%d", w, h)
+        # ──────────────────────────────────────────────────────────────────
+
         self.original = img
         self.gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -243,44 +319,62 @@ class PorosityAnalyzer(BaseAnalyzer):
 
     def analyze(
         self,
-        method: str = "otsu",
+        method: str = "auto",   # "auto" → SmartSegmentor seçer
         min_pore_px: int = 10,
-        scale_um_per_px: float = 1.0,
+        cal: "ScaleCalibration" = None,
     ) -> PorosityResult:
         if self.gray is None:
             raise RuntimeError("No image loaded.")
         if min_pore_px < 1:
             raise ValueError("Min pore size must be ≥ 1 px.")
+        if cal is None:
+            cal = ScaleCalibration()
 
         g = self.gray.copy()
-        if method == "otsu":
-            thresh, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        elif method == "adaptive":
-            mask  = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                          cv2.THRESH_BINARY_INV, 31, 5)
-            thresh = None
-        elif method == "triangle":
-            thresh, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_TRIANGLE)
+
+        # ── AI / Akıllı Segmentasyon ───────────────────────────────────────
+        force = None if method == "auto" else (
+            method if method in ("otsu","adaptive","watershed","multiscale") else None
+        )
+        seg = smart_segment(g, min_pore_px=min_pore_px, cal=cal, force_method=force)
+        self.last_quality = seg["quality"]
+        self.last_seg     = seg
+
+        # Triangle hâlâ destekleniyor (akıllı seçim dışında)
+        if method == "triangle":
+            _, mask_t = cv2.threshold(g, 0, 255,
+                                      cv2.THRESH_BINARY_INV + cv2.THRESH_TRIANGLE)
+            mask_t = cv2.morphologyEx(mask_t, cv2.MORPH_OPEN,
+                                      np.ones((3,3),np.uint8), iterations=2)
+            labeled_t = measure.label(mask_t)
+            props_t   = [p for p in measure.regionprops(labeled_t) if p.area >= min_pore_px]
+            valid_mask = np.zeros_like(mask_t)
+            for p in props_t:
+                valid_mask[labeled_t == p.label] = 255
+            props = props_t
         else:
-            raise ValueError(f"Unknown threshold method: '{method}'")
+            best       = seg["best"]
+            valid_mask = best.mask
+            props      = best.props
+            method     = best.method   # gerçekte kullanılan yöntemi kaydet
 
-        kernel     = np.ones((3, 3), np.uint8)
-        mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-        labeled    = measure.label(mask_clean)
-        props      = [p for p in measure.regionprops(labeled) if p.area >= min_pore_px]
-
-        valid_mask = np.zeros_like(mask_clean)
-        for p in props:
-            valid_mask[labeled == p.label] = 255
-
-        areas     = np.array([p.area   for p in props]) if props else np.array([])
+        areas     = np.array([p.area        for p in props]) if props else np.array([])
         diameters = (2 * np.sqrt(areas / np.pi)) if len(areas) else np.array([])
         eccs      = np.array([p.eccentricity for p in props]) if props else np.array([])
+        thresh    = None
 
         def _pct(arr, q):
             return round(float(np.percentile(arr, q)) if len(arr) else 0, 2)
 
-        mean_d_px = round(float(np.mean(diameters)) if len(diameters) else 0, 2)
+        mean_d_px  = round(float(np.mean(diameters)) if len(diameters) else 0, 2)
+        min_d_px   = round(float(np.min(diameters))  if len(diameters) else 0, 2)
+        max_d_px   = round(float(np.max(diameters))  if len(diameters) else 0, 2)
+        d10_px     = _pct(diameters, 10)
+        d50_px     = _pct(diameters, 50)
+        d90_px     = _pct(diameters, 90)
+
+        # Physical unit conversion — fully automatic from ScaleCalibration
+        nm_per_px  = cal.nm_per_px if cal.is_calibrated else 0.0
 
         result: PorosityResult = {
             "method":         method,
@@ -288,21 +382,29 @@ class PorosityAnalyzer(BaseAnalyzer):
             "porosity_pct":   round(int(np.sum(valid_mask > 0)) / g.size * 100, 3),
             "pore_count":     len(props),
             "mean_diam_px":   mean_d_px,
-            "std_diam_px":    round(float(np.std(diameters))  if len(diameters) else 0, 2),
-            "min_diam_px":    round(float(np.min(diameters))  if len(diameters) else 0, 2),
-            "max_diam_px":    round(float(np.max(diameters))  if len(diameters) else 0, 2),
-            "d10_px":         _pct(diameters, 10),
-            "d50_px":         _pct(diameters, 50),
-            "d90_px":         _pct(diameters, 90),
+            "std_diam_px":    round(float(np.std(diameters)) if len(diameters) else 0, 2),
+            "min_diam_px":    min_d_px,
+            "max_diam_px":    max_d_px,
+            "d10_px":         d10_px,
+            "d50_px":         d50_px,
+            "d90_px":         d90_px,
             "mean_eccentric": round(float(np.mean(eccs)) if len(eccs) else 0, 3),
-            "scale_um_per_px": scale_um_per_px,
-            "mean_diam_um":   round(mean_d_px * scale_um_per_px, 3),
+            # physical dimensions (0.0 when not calibrated)
+            "nm_per_px":      round(nm_per_px, 6),
+            "mean_diam_nm":   round(mean_d_px * nm_per_px, 3),
+            "mean_diam_um":   round(mean_d_px * nm_per_px / 1000, 6),
+            "d10_nm":         round(d10_px     * nm_per_px, 3),
+            "d50_nm":         round(d50_px     * nm_per_px, 3),
+            "d90_nm":         round(d90_px     * nm_per_px, 3),
+            "min_diam_nm":    round(min_d_px   * nm_per_px, 3),
+            "max_diam_nm":    round(max_d_px   * nm_per_px, 3),
             "mask":           valid_mask,
             "props":          props,
             "areas":          areas,
             "diameters":      diameters,
         }
-        log.info("Porosity: %.3f %% | %d pores", result["porosity_pct"], result["pore_count"])
+        log.info("Porosity: %.3f %% | %d pores | nm/px=%.4f",
+                 result["porosity_pct"], result["pore_count"], nm_per_px)
         return result
 
 
@@ -440,7 +542,7 @@ class AnalysisEngine:
         self.site_analyzer  = ActiveSiteAnalyzer()
         self.results:   Dict[str, Any] = {}
         self.img_path:  str            = ""
-        self.scale_um_per_px: float    = 1.0   # 1.0 = px units (not calibrated)
+        self.calibration: ScaleCalibration = ScaleCalibration()  # smart scale object
 
     @property
     def original(self) -> Optional[np.ndarray]:
@@ -459,10 +561,14 @@ class AnalysisEngine:
         img = self.por_analyzer.load_image(path)
         self.foul_analyzer.load_image(path)
         self.site_analyzer.load_image(path)
+        # Keep calibration width in sync with the actual loaded image
+        self.calibration.image_width_px = self.por_analyzer.meta.width
+        log.info("Calibration synced: image_width=%d px | nm/px=%.4f",
+                 self.calibration.image_width_px, self.calibration.nm_per_px)
         return img
 
     def analyze_porosity(self, method="otsu", min_pore_px=10) -> PorosityResult:
-        r = self.por_analyzer.analyze(method, min_pore_px, self.scale_um_per_px)
+        r = self.por_analyzer.analyze(method, min_pore_px, self.calibration)
         self.results["porosity"] = r
         return r
 
@@ -479,8 +585,15 @@ class AnalysisEngine:
     def compare_images(self, p1: str, p2: str, method="otsu") -> ComparisonResult:
         a1, a2 = PorosityAnalyzer(), PorosityAnalyzer()
         a1.load_image(p1); a2.load_image(p2)
-        r1 = a1.analyze(method, scale_um_per_px=self.scale_um_per_px)
-        r2 = a2.analyze(method, scale_um_per_px=self.scale_um_per_px)
+        # Each image may have different px count; build per-image calibration
+        cal1 = ScaleCalibration(self.calibration.scale_value,
+                                self.calibration.scale_unit,
+                                a1.meta.width)
+        cal2 = ScaleCalibration(self.calibration.scale_value,
+                                self.calibration.scale_unit,
+                                a2.meta.width)
+        r1 = a1.analyze(method, cal=cal1)
+        r2 = a2.analyze(method, cal=cal2)
         result: ComparisonResult = {
             "img1_porosity":   r1["porosity_pct"],
             "img2_porosity":   r2["porosity_pct"],
@@ -500,11 +613,15 @@ class AnalysisEngine:
             "app_version": APP_VERSION,
             "exported_at": datetime.datetime.now().isoformat(),
             "image":  {
-                "path":      self.img_path,
-                "width":     self.meta.width,
-                "height":    self.meta.height,
-                "file_kb":   round(self.meta.file_size_kb, 1),
-                "scale_um_per_px": self.scale_um_per_px,
+                "path":          self.img_path,
+                "width":         self.meta.width,
+                "height":        self.meta.height,
+                "file_kb":       round(self.meta.file_size_kb, 1),
+                "scale_value":   self.calibration.scale_value,
+                "scale_unit":    self.calibration.scale_unit,
+                "nm_per_px":     round(self.calibration.nm_per_px, 6),
+                "um_per_px":     round(self.calibration.um_per_px, 9),
+                "calibrated":    self.calibration.is_calibrated,
             },
             "modules": {}
         }
@@ -519,6 +636,502 @@ class AnalysisEngine:
 
 
 # ─── RECENT FILES ─────────────────────────────────────────────────────────────
+
+# ─── SEM / TEM METADATA AUTO-EXTRACTOR ──────────────────────────────────────
+# Reads the info bar (bottom or top strip) of SEM/TEM images via OCR and
+# automatically derives the physical scale (nm/px).
+#
+# Requires:  pip install pytesseract
+#            + system Tesseract:  apt install tesseract-ocr  (Linux)
+#                                 brew install tesseract      (macOS)
+#                                 https://github.com/UB-Mannheim/tesseract (Win)
+# If pytesseract is not installed, auto-detect silently returns None.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_SEM_PATTERNS = {
+    # "View field: 10.4 µm" — the most reliable source
+    "view_field": _re.compile(
+        r"view\s*field[:\s]+([0-9]+[.,]?[0-9]*)\s*(nm|um|µm|\xb5m|mm|pm|'m)",
+        _re.IGNORECASE,
+    ),
+    # standalone scale bar label: "2 µm", "500 nm"  (appears near the bar graphic)
+    "scale_bar": _re.compile(
+        r"\b([0-9]+[.,]?[0-9]*)\s*(nm|um|µm|\xb5m|mm)\b",
+        _re.IGNORECASE,
+    ),
+    # "SEM MAG: 20.0 kx" / "Mag: 20000x"
+    "mag": _re.compile(
+        r"(?:sem\s*)?mag(?:nification)?[:\s]*([0-9]+[.,]?[0-9]*)\s*(kx|k|x)",
+        _re.IGNORECASE,
+    ),
+    # "HV: 20.0 kV" / "SEM HV: 20.0 KV"
+    "hv": _re.compile(
+        r"\b(?:sem\s*)?h[tv][:\s]+([0-9]+[.,]?[0-9]*)\s*(kv|v)",
+        _re.IGNORECASE,
+    ),
+    # "WD: 9.71 mm"
+    "wd": _re.compile(
+        r"\bw\.?d\.?[:\s]+([0-9]+[.,]?[0-9]*)\s*(mm|cm|m)",
+        _re.IGNORECASE,
+    ),
+}
+
+# OCR µm misreads (common with Tesseract on SEM fonts)
+_OCR_UNIT_FIXES = {
+    "pm": "µm",   # most common misread of µm
+    "'m": "µm",
+    "zm": "µm",
+    "ym": "µm",
+    "um": "µm",
+    "\xb5m": "µm",
+}
+_UNIT_TO_NM = {"nm": 1.0, "µm": 1_000.0, "mm": 1_000_000.0}
+
+
+def _fix_unit(raw: str, value: float) -> str:
+    """
+    Correct common OCR misreads of µm.
+    Heuristic: if the corrected unit is pm but value > 0.05, treat as µm —
+    because picometres at that scale are physically nonsensical for SEM.
+    """
+    u = _OCR_UNIT_FIXES.get(raw.lower(), raw.lower())
+    if u == "pm" and value > 0.05:
+        u = "µm"
+    return u
+
+
+def _ocr_bar(gray_strip) -> str:
+    """Run Tesseract on an upscaled binarised strip."""
+    try:
+        import cv2 as _cv2
+        import pytesseract as _tess
+    except ImportError:
+        return ""
+    up  = _cv2.resize(gray_strip, (gray_strip.shape[1]*3, gray_strip.shape[0]*3),
+                      interpolation=_cv2.INTER_CUBIC)
+    _, bw = _cv2.threshold(up, 128, 255, _cv2.THRESH_BINARY)
+    return _tess.image_to_string(bw, config="--psm 6")
+
+
+def extract_sem_metadata(img_path: str) -> dict:
+    """
+    Auto-detect SEM/TEM scale from the info bar of a microscopy image.
+
+    Returns
+    -------
+    dict with keys (all optional — only present when detected):
+        view_field_value  float   physical image width (original unit)
+        view_field_unit   str     "nm" | "µm" | "mm"
+        scale_bar_value   float
+        scale_bar_unit    str
+        magnification     float   linear magnification (e.g. 20000)
+        hv_kv             float   accelerating voltage in kV
+        wd_mm             float   working distance in mm
+        nm_per_px         float   ← primary calibration output
+        cal_source        str     human-readable description of origin
+        img_width_px      int
+        raw_ocr           str     full OCR text (for debugging)
+    """
+    try:
+        import cv2 as _cv2
+    except ImportError:
+        return {}
+
+    gray = _cv2.imread(img_path, _cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        try:
+            from PIL import Image as _PILImg
+            import numpy as _np
+            gray = _np.array(_PILImg.open(img_path).convert("L"))
+        except Exception:
+            return {}
+
+    h, w = gray.shape
+    result: dict = {"img_width_px": w}
+
+    # Scan bottom bar (primary), then top bar (fallback)
+    ocr_texts = []
+    for frac_start, frac_end in [(0.86, 1.0), (0.0, 0.14)]:
+        strip = gray[int(h * frac_start): int(h * frac_end), :]
+        if strip.size == 0:
+            continue
+        txt = _ocr_bar(strip)
+        ocr_texts.append(txt)
+        if not result.get("raw_ocr"):
+            result["raw_ocr"] = txt
+
+        flat = txt.replace("\n", " ")
+
+        # ── View field ───────────────────────────────────────────────────────
+        m = _SEM_PATTERNS["view_field"].search(flat)
+        if m and "view_field_value" not in result:
+            val  = float(m.group(1).replace(",", "."))
+            unit = _fix_unit(m.group(2), val)
+            result["view_field_value"] = val
+            result["view_field_unit"]  = unit
+
+        # ── Scale bar label ──────────────────────────────────────────────────
+        for m in _SEM_PATTERNS["scale_bar"].finditer(flat):
+            val  = float(m.group(1).replace(",", "."))
+            unit = _fix_unit(m.group(2), val)
+            if "scale_bar_value" not in result and val > 0:
+                result["scale_bar_value"] = val
+                result["scale_bar_unit"]  = unit
+                break
+
+        # ── Magnification ────────────────────────────────────────────────────
+        m = _SEM_PATTERNS["mag"].search(flat)
+        if m and "magnification" not in result:
+            val  = float(m.group(1).replace(",", "."))
+            suf  = m.group(2).lower()
+            result["magnification"] = val * 1000 if "k" in suf else val
+
+        # ── HV ───────────────────────────────────────────────────────────────
+        m = _SEM_PATTERNS["hv"].search(flat)
+        if m and "hv_kv" not in result:
+            result["hv_kv"] = float(m.group(1).replace(",", "."))
+
+        # ── WD ───────────────────────────────────────────────────────────────
+        m = _SEM_PATTERNS["wd"].search(flat)
+        if m and "wd_mm" not in result:
+            val  = float(m.group(1).replace(",", "."))
+            unit = m.group(2).lower()
+            result["wd_mm"] = val * 10 if unit == "cm" else val
+
+    # ── Compute nm_per_px (priority: view_field > magnification) ─────────────
+    nm_per_px = None
+    source    = "none"
+
+    if "view_field_value" in result:
+        vf     = result["view_field_value"]
+        unit   = result["view_field_unit"]
+        factor = _UNIT_TO_NM.get(unit, 1.0)
+        nm_per_px = (vf * factor) / w
+        source = f"View field: {vf} {unit} / {w} px"
+
+    elif "magnification" in result:
+        # Typical SEM sensor width ≈ 130 µm; rough estimate only
+        sensor_nm = 130_000
+        nm_per_px = sensor_nm / (result["magnification"] * w)
+        source = f"Magnification: {result['magnification']}× (estimated)"
+
+    result["nm_per_px"]   = nm_per_px
+    result["cal_source"]  = source
+    log.info("SEM auto-detect: %s → %.4f nm/px", source,
+             nm_per_px if nm_per_px else 0)
+    return result
+
+def detect_info_bar_row(img: np.ndarray, search_frac: float = 0.65) -> int:
+    """
+    Detect the pixel row where the SEM/TEM info bar begins.
+
+    Uses horizontal Sobel edge energy — the info bar always starts with a
+    sharp horizontal boundary line separating it from the micrograph content.
+
+    Parameters
+    ----------
+    img          : BGR or grayscale image (numpy array)
+    search_frac  : only search in the bottom (1-search_frac) fraction
+
+    Returns
+    -------
+    int  row index of the bar boundary (exclusive — crop to img[:row])
+         -1 if no clear bar detected (pure content, no overlay strip)
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+
+    search_start = int(h * search_frac)
+    region       = gray[search_start:, :]
+
+    sobel_y    = cv2.Sobel(region.astype(np.float32), cv2.CV_32F, 0, 1, ksize=5)
+    row_energy = np.sum(np.abs(sobel_y), axis=1)
+
+    peak_local = int(np.argmax(row_energy))
+    peak_val   = float(row_energy[peak_local])
+    mean_energy = float(np.mean(row_energy))
+
+    # Require peak to be significantly above average noise level
+    if mean_energy < 1e-6 or peak_val < mean_energy * 2.5:
+        return -1   # no bar found
+
+    # Return 2 rows above the separator line to avoid including it
+    bar_row = search_start + peak_local - 2
+    log.info("Info bar detected at row %d / %d  (%.1f%%)", bar_row, h, bar_row/h*100)
+    return max(bar_row, 0)
+
+# ─── AI / AKILLI SEGMENTASYoN MODÜLü ────────────────────────────────────────
+# CPU'da çalışan, internet gerektirmeyen akıllı segmentasyon sistemi.
+#
+# Bileşenler:
+#   1. AutoThreshold   — histogram analizi ile en iyi yöntemi seçer
+#   2. ImageQualityScorer — analiz öncesi görüntü kalitesini puanlar
+#   3. SmartSegmentor  — 4 yöntemi çalıştırır, en iyisini önerir
+#      a) Otsu (klasik)
+#      b) Watershed   — birleşik bölgeleri ayırır (AI-like davranış)
+#      c) Adaptive+CLAHE — düzensiz aydınlatmada
+#      d) Multi-scale Ensemble — 3 sigma'da Otsu, en az 2/3 oyu al
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dc, field as _field
+from typing import Tuple as _Tuple
+
+@_dc
+class QualityScore:
+    sharpness:   int = 0   # 0-100
+    contrast:    int = 0
+    snr:         int = 0
+    uniformity:  int = 0   # aydınlatma eşitliği
+    overall:     int = 0
+    snr_db:      float = 0.0
+    vignette_ratio: float = 0.0
+    recommended_method: str = "otsu"
+    reason: str = ""
+
+    def label(self) -> str:
+        if self.overall >= 75: return "✓ Yüksek kalite"
+        if self.overall >= 50: return "✓ Analiz edilebilir"
+        return "⚠ Düşük kalite — sonuçları doğrulayın"
+
+    def bar(self, v: int, width: int = 10) -> str:
+        filled = round(v / 100 * width)
+        return "█" * filled + "░" * (width - filled)
+
+
+def score_image_quality(gray: np.ndarray) -> QualityScore:
+    """
+    Görüntü kalitesini 4 metrikte 0-100 arası puanlar ve
+    en uygun eşikleme yöntemini önerir.
+    """
+    h, w = gray.shape
+
+    # 1. Odak (Laplacian varyansı)
+    lap_var   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharpness = min(100, int(lap_var / 5))
+
+    # 2. Kontrast (normalize std)
+    contrast_score = min(100, int(np.std(gray) / 128 * 100))
+
+    # 3. SNR
+    blurred   = cv2.GaussianBlur(gray, (5, 5), 0)
+    noise     = float(np.std(gray.astype(float) - blurred.astype(float)))
+    signal    = float(np.std(gray.astype(float)))
+    snr_db    = 20 * np.log10(signal / max(noise, 1e-9))
+    snr_score = min(100, int(snr_db * 3))
+
+    # 4. Aydınlatma eşitliği (vinyeting)
+    cy, cx     = h // 4, w // 4
+    center     = gray[cy:h-cy, cx:w-cx]
+    corners    = np.concatenate([
+        gray[:h//6, :w//6].flatten(), gray[-h//6:, -w//6:].flatten(),
+        gray[:h//6, -w//6:].flatten(), gray[-h//6:, :w//6].flatten(),
+    ])
+    vig_ratio  = abs(float(np.mean(center)) - float(np.mean(corners))) / 255.0
+    vig_score  = max(0, int((1 - vig_ratio * 5) * 100))
+
+    overall = int(sharpness * 0.30 + contrast_score * 0.25 +
+                  snr_score * 0.25 + vig_score * 0.20)
+
+    # ── Akıllı yöntem seçimi ──────────────────────────────────────────────
+    # Bimodality coefficient (Sarle 1981)
+    flat      = gray.flatten().astype(float)
+    try:
+        from scipy.stats import skew as _sk, kurtosis as _ku
+        skewness  = float(_sk(flat))
+        kurt_val  = float(_ku(flat))
+    except ImportError:
+        skewness, kurt_val = 0.0, 0.0
+    bimodality = (skewness ** 2 + 1) / (kurt_val + 3 + 1e-9)
+
+    if vig_ratio > 0.05:
+        recommended = "adaptive"
+        reason = (f"Düzensiz aydınlatma tespit edildi "
+                  f"(merkez/köşe farkı: {vig_ratio*100:.1f}%)")
+    elif bimodality > 0.555:
+        recommended = "otsu"
+        reason = (f"Bimodal histogram (BC={bimodality:.3f} > 0.555) "
+                  f"— Otsu için ideal")
+    else:
+        recommended = "triangle"
+        reason = (f"Unimodal histogram (BC={bimodality:.3f} ≤ 0.555) "
+                  f"— seyrek yapılar için Triangle")
+
+    return QualityScore(
+        sharpness=sharpness, contrast=contrast_score,
+        snr=snr_score, uniformity=vig_score, overall=overall,
+        snr_db=round(snr_db, 1), vignette_ratio=round(vig_ratio, 3),
+        recommended_method=recommended, reason=reason,
+    )
+
+
+def segment_watershed(gray: np.ndarray, min_pore_px: int = 8,
+                       min_distance: int = 8) -> _Tuple[np.ndarray, np.ndarray]:
+    """
+    Otsu + Distance Transform + Watershed.
+    Birleşik (aglomere) bölgeleri otomatik olarak ayırır.
+    Returns: (labeled_image, binary_mask)
+    """
+    g_den  = cv2.fastNlMeansDenoising(gray, h=7,
+                 templateWindowSize=7, searchWindowSize=21)
+    _, mask = cv2.threshold(g_den, 0, 255,
+                            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    mask    = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                               np.ones((3, 3), np.uint8), iterations=2)
+    dist    = ndimage.distance_transform_edt(mask)
+
+    from skimage.feature import peak_local_max
+    from skimage import segmentation as _seg
+
+    coords  = peak_local_max(dist, min_distance=min_distance, labels=mask)
+    markers = np.zeros(dist.shape, dtype=bool)
+    if len(coords):
+        markers[tuple(coords.T)] = True
+    markers, _ = ndimage.label(markers)
+    labels  = _seg.watershed(-dist, markers, mask=mask)
+    return labels, mask
+
+
+def segment_multiscale(gray: np.ndarray,
+                       sigmas=(0.5, 1.0, 2.0),
+                       min_votes: int = 2) -> np.ndarray:
+    """
+    Farklı Gaussian sigma değerlerinde Otsu uygular ve oylama yapar.
+    En az `min_votes` yöntemde gözenek olarak işaretlenen pikseller tutulur.
+    Returns: binary mask (uint8, 0/255)
+    """
+    votes = np.zeros(gray.shape, dtype=np.int32)
+    for sigma in sigmas:
+        blur = cv2.GaussianBlur(gray, (0, 0), sigma)
+        _, m = cv2.threshold(blur, 0, 255,
+                             cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        votes += (m > 0).astype(np.int32)
+    mask = ((votes >= min_votes).astype(np.uint8) * 255)
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            np.ones((3, 3), np.uint8), iterations=2)
+
+
+@_dc
+class SegmentationResult:
+    method:      str
+    mask:        np.ndarray
+    labels:      np.ndarray
+    props:       list
+    porosity_pct: float
+    pore_count:  int
+    diameters_px: np.ndarray
+    quality_score: float = 0.0   # 0-1, internal ranking score
+
+
+def smart_segment(gray: np.ndarray,
+                  min_pore_px: int = 8,
+                  cal: "ScaleCalibration" = None,
+                  force_method: str = None) -> dict:
+    """
+    Görüntüyü 4 farklı yöntemle segmente eder.
+    Her yönteme bir kalite skoru verir ve en iyisini işaretler.
+
+    Parameters
+    ----------
+    gray         : gri ton görüntü (kırpılmış, bilgi çubuğu yok)
+    min_pore_px  : minimum gözenek alanı (piksel)
+    cal          : ScaleCalibration objesi (opsiyonel)
+    force_method : None → otomatik seç  |  "otsu"/"adaptive"/"watershed"/"multiscale"
+
+    Returns
+    -------
+    dict with keys:
+        "recommended"  : str — önerilen yöntem adı
+        "quality"      : QualityScore
+        "methods"      : dict[str, SegmentationResult]
+        "best"         : SegmentationResult
+    """
+    K3 = np.ones((3, 3), np.uint8)
+
+    quality = score_image_quality(gray)
+    if cal is not None:
+        quality.recommended_method = (
+            force_method or quality.recommended_method
+        )
+    recommended_method = force_method or quality.recommended_method
+
+    clahe   = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    g_clahe = clahe.apply(gray)
+
+    def _make_result(method, mask, labels=None):
+        if labels is None:
+            labeled = measure.label(mask)
+        else:
+            labeled = labels
+        props = [p for p in measure.regionprops(labeled) if p.area >= min_pore_px]
+        if labels is None:
+            vm = np.zeros_like(mask)
+            for p in props:
+                vm[labeled == p.label] = 255
+        else:
+            vm = (labels > 0).astype(np.uint8) * 255
+        areas = np.array([p.area for p in props]) if props else np.array([])
+        diams = (2 * np.sqrt(areas / np.pi)) if len(areas) else np.array([])
+        por   = round(float(np.sum(vm > 0)) / gray.size * 100, 3)
+        # Quality ranking: reward moderate porosity (5-60%) and pore count
+        q_score = 0.0
+        if 5 <= por <= 60:
+            q_score += 0.5
+        if len(props) >= 10:
+            q_score += 0.3 * min(1.0, len(props) / 100)
+        if len(diams) > 1:
+            cv_diams = float(np.std(diams)) / (float(np.mean(diams)) + 1e-9)
+            q_score += 0.2 * (1 - min(1.0, cv_diams))
+        return SegmentationResult(
+            method=method, mask=vm, labels=labeled,
+            props=props, porosity_pct=por, pore_count=len(props),
+            diameters_px=diams, quality_score=round(q_score, 3),
+        )
+
+    results = {}
+
+    # A — Otsu
+    _, m_otsu = cv2.threshold(gray, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    m_otsu = cv2.morphologyEx(m_otsu, cv2.MORPH_OPEN, K3, iterations=2)
+    results["otsu"] = _make_result("otsu", m_otsu)
+
+    # B — Watershed
+    lab_ws, _ = segment_watershed(gray, min_pore_px, min_distance=8)
+    results["watershed"] = _make_result("watershed", None, labels=lab_ws)
+
+    # C — Adaptive + CLAHE
+    m_adp = cv2.adaptiveThreshold(g_clahe, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 31, 5)
+    m_adp = cv2.morphologyEx(m_adp, cv2.MORPH_OPEN, K3, iterations=2)
+    results["adaptive"] = _make_result("adaptive", m_adp)
+
+    # D — Multi-scale Ensemble
+    m_ms = segment_multiscale(gray)
+    results["multiscale"] = _make_result("multiscale", m_ms)
+
+    # Pick best — honour recommendation if quality score is reasonable
+    rec = results.get(recommended_method)
+    if rec and rec.quality_score >= 0.3:
+        best_key = recommended_method
+    else:
+        best_key = max(results, key=lambda k: results[k].quality_score)
+
+    log.info("SmartSegment: recommended=%s  best=%s  quality=%d/100",
+             recommended_method, best_key, quality.overall)
+
+    return {
+        "recommended": best_key,
+        "quality":     quality,
+        "methods":     results,
+        "best":        results[best_key],
+    }
+
+
+
+
 
 def load_recent() -> List[str]:
     try:
@@ -561,9 +1174,10 @@ LANG: Dict[str, Dict[str, str]] = {
         "sec_params":      "PARAMETRELER",
         "sec_actions":     "İŞLEMLER",
         "sec_scale":       "ÖLÇEK KALİBRASYONU",
+        "sec_scale_hint":  "Görüntünün temsil ettiği gerçek boyutu girin",
         "lbl_img1":        "Birincil Görüntü",
         "lbl_img2":        "Karşılaştırma Görüntüsü",
-        "lbl_scale":       "px / µm (0 = px birimi)",
+        "lbl_scale":       "Görüntü genişliği (fiziksel değer)   ← veya otomatik algıla",
         "btn_open":        "Aç",
         "mode_por":        "Porozite Analizi",
         "mode_foul":       "Fouling Katmanı",
@@ -710,9 +1324,10 @@ LANG: Dict[str, Dict[str, str]] = {
         "sec_params":      "PARAMETERS",
         "sec_actions":     "ACTIONS",
         "sec_scale":       "SCALE CALIBRATION",
+        "sec_scale_hint":  "Enter the physical size the image represents",
         "lbl_img1":        "Primary Image",
         "lbl_img2":        "Comparison Image",
-        "lbl_scale":       "px / µm  (0 = pixel units)",
+        "lbl_scale":       "Image width (physical value)   ← or auto-detect",
         "btn_open":        "Open",
         "mode_por":        "Porosity Analysis",
         "mode_foul":       "Fouling Layer",
@@ -1207,14 +1822,51 @@ class MembraneAnalyzerApp(tk.Tk):
 
         _sep(p).pack(fill="x", padx=10, pady=10)
 
-        # ── Scale Calibration
+        # ── Smart Scale Calibration ─────────────────────────────────────────
         self._sh(p, "sec_scale")
-        self._sl(p, "lbl_scale")
-        self.scale_var = tk.DoubleVar(value=0.0)
-        scale_entry = tk.Entry(p, textvariable=self.scale_var, bg=C["bg_input"],
-                               fg=C["text_md"], insertbackground=C["teal"],
-                               relief="flat", font=FT["mono_s"], bd=0, width=10)
-        scale_entry.pack(fill="x", padx=10, ipady=5, pady=(2, 10))
+
+        hint = tk.Label(p, text=self.t("sec_scale_hint"), font=FT["small"],
+                        fg=C["text_lo"], bg=C["bg_panel"], wraplength=270,
+                        justify="left")
+        hint.pack(anchor="w", padx=10, pady=(0, 4))
+        self._i18n_reg(hint, "text", "sec_scale_hint")
+
+        # Row: value entry + unit dropdown
+        scale_row = tk.Frame(p, bg=C["bg_panel"])
+        scale_row.pack(fill="x", padx=10, pady=(2, 4))
+
+        self.scale_val_var = tk.StringVar(value="")
+        val_entry = tk.Entry(scale_row, textvariable=self.scale_val_var,
+                             bg=C["bg_input"], fg=C["text_hi"],
+                             insertbackground=C["teal"], relief="flat",
+                             font=(F_NUM, 11, "bold"), bd=0, width=10)
+        val_entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 6))
+
+        self.scale_unit_var = tk.StringVar(value="nm")
+        unit_cb = ttk.Combobox(scale_row, textvariable=self.scale_unit_var,
+                               values=["nm", "µm", "mm"],
+                               state="readonly", font=FT["body"], width=5)
+        unit_cb.pack(side="right", ipady=4)
+
+        # "Auto Detect" button — triggers OCR on the loaded image
+        auto_btn = tk.Button(
+            scale_row, text="⟳ Auto",
+            command=lambda: self._auto_detect_scale(self.img_path.get()) if self.img_path.get() else None,
+            bg=C["teal_dim"], fg=C["teal"], relief="flat", cursor="hand2",
+            font=FT["small"], activebackground=C["teal"],
+            activeforeground=C["text_inv"], padx=6)
+        auto_btn.pack(side="right", ipady=4, padx=(4, 0))
+
+        # Live derived info label
+        self._scale_info_lbl = tk.Label(p, text="",
+                                        font=FT["mono_s"], fg=C["teal"],
+                                        bg=C["bg_panel"], wraplength=270,
+                                        justify="left", anchor="w")
+        self._scale_info_lbl.pack(fill="x", padx=10, pady=(0, 8))
+
+        # Bind live update
+        for v in (self.scale_val_var, self.scale_unit_var):
+            v.trace_add("write", self._on_scale_change)
 
         _sep(p).pack(fill="x", padx=10, pady=10)
 
@@ -1235,9 +1887,10 @@ class MembraneAnalyzerApp(tk.Tk):
         # ── Parameters
         self._sh(p, "sec_params")
         self._sl(p, "lbl_thresh")
-        self.thresh_var = tk.StringVar(value="otsu")
+        self.thresh_var = tk.StringVar(value="auto")
         cb_thresh = ttk.Combobox(p, textvariable=self.thresh_var,
-                                 values=["otsu", "adaptive", "triangle"],
+                                 values=["auto", "otsu", "adaptive", "triangle",
+                                         "watershed", "multiscale"],
                                  state="readonly", font=FT["body"])
         cb_thresh.pack(fill="x", padx=10, pady=(2, 10))
 
@@ -1258,7 +1911,7 @@ class MembraneAnalyzerApp(tk.Tk):
 
         # Mark dirty on param change
         for var in (self.thresh_var, self.min_pore_var, self.side_var,
-                    self.cluster_var, self.scale_var):
+                    self.cluster_var, self.scale_val_var, self.scale_unit_var):
             var.trace_add("write", self._mark_dirty)
 
         _sep(p).pack(fill="x", padx=10, pady=10)
@@ -1471,6 +2124,116 @@ class MembraneAnalyzerApp(tk.Tk):
         self._params_dirty = False
         self._remind_lbl.configure(text="")
 
+    def _auto_detect_scale(self, path: str):
+        """
+        Called after image load. Runs SEM metadata OCR in a background
+        thread and populates the scale fields if successful.
+        """
+        def _worker():
+            meta = extract_sem_metadata(path)
+            nm   = meta.get("nm_per_px")
+            vf_v = meta.get("view_field_value")
+            vf_u = meta.get("view_field_unit", "µm")
+            src  = meta.get("cal_source", "")
+            mag  = meta.get("magnification")
+            hv   = meta.get("hv_kv")
+            wd   = meta.get("wd_mm")
+
+            if nm and nm > 0:
+                self.after(0, lambda: self._apply_auto_scale(vf_v, vf_u, nm, src, meta))
+            else:
+                log.info("Auto-detect: no scale found in %s", path)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_auto_scale(self, vf_v, vf_u, nm_per_px, source, meta):
+        """Apply auto-detected scale to the UI — runs on main thread."""
+        # Populate the scale entry fields
+        if vf_v is not None:
+            self.scale_val_var.set(str(vf_v))
+            self.scale_unit_var.set(vf_u)
+        else:
+            # No view field but we have nm_per_px from magnification
+            # Show in nm with image width
+            w  = self.engine.meta.width or 1
+            nm_total = nm_per_px * w
+            self.scale_val_var.set(f"{nm_total:.1f}")
+            self.scale_unit_var.set("nm")
+
+        # Sync engine calibration immediately
+        self.engine.calibration.scale_value    = float(self.scale_val_var.get())
+        self.engine.calibration.scale_unit     = self.scale_unit_var.get()
+        self.engine.calibration.image_width_px = self.engine.meta.width
+
+        # Build a rich info string with all detected metadata
+        parts = []
+        if meta.get("magnification"):
+            parts.append(f"Büyütme: {meta['magnification']:.0f}×" if self._lang == "TR"
+                         else f"Mag: {meta['magnification']:.0f}×")
+        if meta.get("hv_kv"):
+            parts.append(f"HV: {meta['hv_kv']} kV")
+        if meta.get("wd_mm"):
+            parts.append(f"WD: {meta['wd_mm']} mm")
+
+        extra = "   ·   ".join(parts)
+        lbl_auto = "Ölçek otomatik algılandı" if self._lang == "TR" else "Scale auto-detected"
+        phys_str = f"{source}  →  {nm_per_px:.4f} nm/px"
+        log_msg  = lbl_auto + ": " + phys_str
+        if extra:
+            log_msg += "\n" + extra
+
+        self._log_add(log_msg, "ok")
+        self._on_scale_change()
+
+        # Flash the scale info label briefly in teal to signal auto-fill
+        self._scale_info_lbl.configure(fg=C["teal"])
+        self.after(2500, lambda: self._scale_info_lbl.configure(fg=C["teal"]))
+
+    def _on_scale_change(self, *_):
+        """Live update: recalculate nm/px as user types and show derived info."""
+        try:
+            val  = float(self.scale_val_var.get().replace(",", "."))
+        except (ValueError, AttributeError):
+            self._scale_info_lbl.configure(text="")
+            return
+
+        unit = self.scale_unit_var.get() or "nm"
+        w    = self.engine.meta.width if self.engine.meta.width > 0 else 1
+
+        # Build a temporary calibration to compute values
+        tmp = ScaleCalibration(scale_value=val, scale_unit=unit, image_width_px=w)
+
+        if not tmp.is_calibrated:
+            self._scale_info_lbl.configure(text="")
+            return
+
+        nm_px = tmp.nm_per_px
+        um_px = tmp.um_per_px
+
+        # Auto-pick best display unit for the per-pixel value
+        if nm_px >= 1000:
+            px_str = f"{um_px:.4f} µm/px"
+        else:
+            px_str = f"{nm_px:.4f} nm/px"
+
+        # Show what the full image spans
+        factor = {"nm": 1.0, "µm": 1_000.0, "mm": 1_000_000.0}.get(unit, 1.0)
+        total_nm = val * factor
+        if total_nm >= 1_000_000:
+            total_str = f"{total_nm/1_000_000:.3f} mm"
+        elif total_nm >= 1_000:
+            total_str = f"{total_nm/1_000:.3f} µm"
+        else:
+            total_str = f"{total_nm:.1f} nm"
+
+        if w > 1:
+            info = f"→ {px_str}   (görüntü: {total_str} / {w} px)"
+        else:
+            info = f"→ {px_str}   (görüntü henüz yüklenmedi)"
+
+        self._scale_info_lbl.configure(text=info)
+        log.info("Scale preview: %s", info)
+
     # ── PLACEHOLDER ───────────────────────────────────────────────────────────
     def _placeholder(self):
         self.img_canvas.update_idletasks()
@@ -1503,16 +2266,24 @@ class MembraneAnalyzerApp(tk.Tk):
         self.img_path.set(path)
         pil = Image.fromarray(cv2.cvtColor(self.engine.original, cv2.COLOR_BGR2RGB))
         self.img_canvas.show_pil(pil)
-        # Info bar overlay
+        # Info bar overlay — append [cropped] if bar was removed
+        orig_full = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        full_h    = orig_full.shape[0] if orig_full is not None else 0
+        crop_note = ""
+        if full_h > 0 and self.engine.meta.height < full_h:
+            removed   = full_h - self.engine.meta.height
+            crop_note = f"  · ✂ bilgi çubuğu kırpıldı ({removed} px)"
         self.img_canvas.create_rectangle(0, 0, self.img_canvas.winfo_width(), 22,
                                          fill="#00000077", outline="")
         self.img_canvas.create_text(10, 11, anchor="w",
-                                    text=self.engine.meta.label(),
+                                    text=self.engine.meta.label() + crop_note,
                                     font=FT["mono_s"], fill=C["text_lo"])
         self._log_add(self.t("log_loaded") + Path(path).name, "ok")
         self._recent = add_recent(path, self._recent)
         save_recent(self._recent)
         self._rebuild_recent_menu()
+        # Try to auto-detect scale from SEM info bar
+        self.after(80, lambda p=path: self._auto_detect_scale(p))
 
     def _show_cv2(self, bgr: np.ndarray):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -1549,12 +2320,18 @@ class MembraneAnalyzerApp(tk.Tk):
         if mode == "Comparison" and (not self.img_path.get() or not self.img_path2.get()):
             messagebox.showwarning(self.t("dlg_two_img"), self.t("dlg_two_img_msg"))
             return
-        # Sync scale
+        # Sync smart scale calibration — image_width_px is already set by load_image
         try:
-            scale = float(self.scale_var.get())
-            self.engine.scale_um_per_px = scale if scale > 0 else 1.0
-        except Exception:
-            self.engine.scale_um_per_px = 1.0
+            val = float(self.scale_val_var.get().replace(",", "."))
+        except (ValueError, AttributeError):
+            val = 0.0
+        unit = self.scale_unit_var.get() or "nm"
+        self.engine.calibration.scale_value = val
+        self.engine.calibration.scale_unit  = unit
+        # image_width_px was synced at load time; re-apply in case user
+        # typed a value before loading (engine may hold stale 1)
+        if self.engine.meta.width > 0:
+            self.engine.calibration.image_width_px = self.engine.meta.width
 
         self._clear_dirty()
         self.progress.start(8)
@@ -1615,23 +2392,58 @@ class MembraneAnalyzerApp(tk.Tk):
 
     # ── DISPLAY ───────────────────────────────────────────────────────────────
     def _disp_porosity(self, r: PorosityResult):
+        cal = self.engine.calibration
+
+        def _fmt(px_val: float) -> str:
+            """Format a pixel length with physical unit if calibrated."""
+            if cal.is_calibrated:
+                return f"{px_val:.2f} px  =  {cal.format_length(px_val)}"
+            return f"{px_val:.2f} px"
+
         self._clr_rt()
+
+        # ── Kalite skoru + akıllı öneri ───────────────────────────────────
+        q = getattr(self.engine.por_analyzer, "last_quality", None)
+        if q:
+            self.rt.configure(state="normal")
+            self.rt.insert("end", f"\n  GÖRÜNTÜ KALİTE SKORU\n  {'─'*46}\n", "hdr")
+            def _bar(v): return "█"*(v//10) + "░"*(10-v//10)
+            for lbl, val, unit in [
+                ("Odak (sharpness)", q.sharpness, "%"),
+                ("Kontrast",         q.contrast,  "%"),
+                ("SNR",              q.snr,       f"%  ({q.snr_db} dB)"),
+                ("Aydınlatma eşitliği", q.uniformity, "%"),
+                ("Genel",            q.overall,   f"/100  {q.label()}"),
+            ]:
+                tag = "ok" if val >= 60 else "warn"
+                self.rt.insert("end", f"  {lbl:<28}", "key")
+                self.rt.insert("end", f"{_bar(val)}  {val}{unit}\n", tag)
+            self.rt.insert("end", f"\n  ⚡ Önerilen yöntem: {q.recommended_method.upper()}\n", "info")
+            self.rt.insert("end", f"     {q.reason}\n\n", "key")
+
         self._rt_head("hdr_por")
-        self._rt_row("k_method",    r["method"].upper(), "info")
-        self._rt_row("k_porosity",  f"{r['porosity_pct']:.3f} %",
+        self._rt_row("k_method",     r["method"].upper(), "info")
+        self._rt_row("k_porosity",   f"{r['porosity_pct']:.3f} %",
                      "warn" if r["porosity_pct"] < 5 else "ok")
         self._rt_row("k_pore_count", r["pore_count"])
+
+        if cal.is_calibrated:
+            # Show calibration summary inline
+            lbl_scale = "Ölçek:" if self._lang == "TR" else "Scale:"
+            cal_line  = f"  {lbl_scale:<36}{cal.summary()}"
+            self.rt.insert("end", cal_line + "\n", "info")
+
+
         self._rt_head("hdr_psd")
-        self._rt_row("k_mean_diam",    r["mean_diam_px"])
-        self._rt_row("k_mean_diam_um", f"{r['mean_diam_um']:.3f}" if self.engine.scale_um_per_px != 1.0 else "N/A (not calibrated)")
-        self._rt_row("k_std_diam",     r["std_diam_px"])
-        self._rt_row("k_min_diam",     r["min_diam_px"])
-        self._rt_row("k_max_diam",     r["max_diam_px"])
+        self._rt_row("k_mean_diam",   _fmt(r["mean_diam_px"]))
+        self._rt_row("k_std_diam",    f"{r['std_diam_px']:.2f} px")
+        self._rt_row("k_min_diam",    _fmt(r["min_diam_px"]))
+        self._rt_row("k_max_diam",    _fmt(r["max_diam_px"]))
         self._rt_head("hdr_psd_pct")
-        self._rt_row("k_d10",       r["d10_px"])
-        self._rt_row("k_d50",       r["d50_px"])
-        self._rt_row("k_d90",       r["d90_px"])
-        self._rt_row("k_eccentric", r["mean_eccentric"])
+        self._rt_row("k_d10",         _fmt(r["d10_px"]))
+        self._rt_row("k_d50",         _fmt(r["d50_px"]))
+        self._rt_row("k_d90",         _fmt(r["d90_px"]))
+        self._rt_row("k_eccentric",   r["mean_eccentric"])
         self.rt.configure(state="disabled")
 
         self.mc["porosity"].set(f"{r['porosity_pct']:.2f}")
@@ -1649,8 +2461,13 @@ class MembraneAnalyzerApp(tk.Tk):
         self._rt_head("hdr_foul")
         self._rt_row("k_side",      r["layer_side"].upper(), "info")
         self._rt_row("k_interface", r["interface_row_px"])
-        self._rt_row("k_f_px",      r["fouling_thickness_px"])
-        self._rt_row("k_f_pct",     f"{r['fouling_thickness_pct']:.2f} %",
+        cal = self.engine.calibration
+        thick_px  = r["fouling_thickness_px"]
+        thick_fmt = f"{thick_px} px"
+        if cal.is_calibrated:
+            thick_fmt += f"  =  {cal.format_length(thick_px)}"
+        self._rt_row("k_f_px",  thick_fmt)
+        self._rt_row("k_f_pct", f"{r['fouling_thickness_pct']:.2f} %",
                      "warn" if r["fouling_thickness_pct"] > 30 else "ok")
         self._rt_head("hdr_int")
         self._rt_row("k_l_int",    r["layer_mean_intensity"])
@@ -1726,15 +2543,42 @@ class MembraneAnalyzerApp(tk.Tk):
         ax1.axis("off")
 
         if len(r["diameters"]) > 0:
-            ax2.hist(r["diameters"], bins=30, color=C["teal"],
+            cal = self.engine.calibration
+            # Convert diameters to physical units if calibrated
+            if cal.is_calibrated:
+                nm_px = cal.nm_per_px
+                diams_phys = r["diameters"] * nm_px
+                d10_p  = r["d10_px"] * nm_px
+                d50_p  = r["d50_px"] * nm_px
+                d90_p  = r["d90_px"] * nm_px
+                # choose best display unit
+                med = float(np.median(diams_phys))
+                if med >= 1_000_000:
+                    diams_plot = diams_phys / 1_000_000
+                    d10_p /= 1_000_000; d50_p /= 1_000_000; d90_p /= 1_000_000
+                    x_label = "Diameter (mm)"
+                elif med >= 1_000:
+                    diams_plot = diams_phys / 1_000
+                    d10_p /= 1_000; d50_p /= 1_000; d90_p /= 1_000
+                    x_label = "Diameter (µm)"
+                else:
+                    diams_plot = diams_phys
+                    x_label = "Diameter (nm)"
+            else:
+                diams_plot = r["diameters"]
+                d10_p, d50_p, d90_p = r["d10_px"], r["d50_px"], r["d90_px"]
+                x_label = self.t("ax_diam")
+
+            ax2.hist(diams_plot, bins=30, color=C["teal"],
                      alpha=0.8, edgecolor=C["teal_dim"], linewidth=0.5)
             for p_val, p_name, p_col in [
-                (r["d10_px"], "D10", C["blue"]),
-                (r["d50_px"], "D50", C["amber"]),
-                (r["d90_px"], "D90", C["red"]),
+                (d10_p, "D10", C["blue"]),
+                (d50_p, "D50", C["amber"]),
+                (d90_p, "D90", C["red"]),
             ]:
-                ax2.axvline(p_val, color=p_col, lw=1.2, ls="--", label=f"{p_name}={p_val:.1f}")
-            ax2.set_xlabel(self.t("ax_diam"),  color=C["text_lo"], fontsize=8)
+                ax2.axvline(p_val, color=p_col, lw=1.2, ls="--",
+                            label=f"{p_name}={p_val:.2f}")
+            ax2.set_xlabel(x_label,            color=C["text_lo"], fontsize=8)
             ax2.set_ylabel(self.t("ax_count"), color=C["text_lo"], fontsize=8)
             ax2.set_title(self.t("ct_psd"),    color=C["teal"],    fontsize=9, pad=5)
             ax2.legend(fontsize=6, facecolor=C["bg_card"],
